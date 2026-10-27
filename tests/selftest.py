@@ -3,7 +3,7 @@
 1. Builds a synthetic track with known answers (130 BPM kick, 45 Hz sub, G major chord,
    quiet 8-bar intro then loud section, one clipped peak) and checks listen()'s report.
 2. Checks MP3/FLAC decoding, compare(), and the folder guard.
-3. Starts the real MCP server over stdio and calls it like Claude would.
+3. Starts the real MCP server over stdio and calls it like an MCP client would.
 
 Run:  .venv\\Scripts\\python.exe tests\\selftest.py
 """
@@ -36,6 +36,11 @@ def check(ok: bool, what: str) -> bool:
     RESULTS.append((bool(ok), what))
     print(("  PASS  " if ok else "  FAIL  ") + what)
     return bool(ok)
+
+
+def report(result) -> dict:
+    """Structured report from a direct MCP tool-function call."""
+    return result.structured_content
 
 
 def synth(path: Path, intro_bars=8, main_bars=16, extra_bars=0, sub_gain=1.0, chord_gain=1.0, clip=True):
@@ -115,8 +120,8 @@ def run_notes_test():
     synth_chords(wav)
     t0 = time.time()
     res = server.notes(str(wav), bpm=130, stem="mix", bars="1-4")
-    rep = json.loads(res[0])
-    print(f"  notes() took {time.time() - t0:.1f} s; JSON {len(res[0])} chars")
+    rep = report(res)
+    print(f"  notes() took {time.time() - t0:.1f} s; JSON {len(res.content[0].text)} chars")
     for k in ("notes_found", "range", "key_from_notes", "chords_per_bar", "bass_roots_per_bar"):
         print(f"    {k}: {json.dumps(rep.get(k), ensure_ascii=False)}")
     for row in rep["detail"]["rows"]:
@@ -157,8 +162,8 @@ def run_describe_test():
         return float(row.split(": ")[1].split(" ")[0])
 
     t0 = time.time()
-    drums = json.loads(server.describe(str(TEST_DIR / "synthetic_130_Gmaj.wav"), bpm=130, phrases=[kick_phrase]))
-    chords = json.loads(server.describe(str(TEST_DIR / "synthetic_chords_130.wav"), bpm=130, phrases=[kick_phrase]))
+    drums = report(server.describe(str(TEST_DIR / "synthetic_130_Gmaj.wav"), bpm=130, phrases=[kick_phrase]))
+    chords = report(server.describe(str(TEST_DIR / "synthetic_chords_130.wav"), bpm=130, phrases=[kick_phrase]))
     print(f"  two describe() calls took {time.time() - t0:.1f} s")
     print(f"    chords-only track: {chords['per_section'][0]}")
     top_groove = chords["whole_track"]["groove"]["top"][0]
@@ -176,7 +181,7 @@ def run_time_tests():
 
     print("\n== 9. expect / listen_live / sounds_like: listening as prediction")
     wav = str(TEST_DIR / "synthetic_130_Gmaj.wav")
-    rep = json.loads(server.expect(wav, bpm=130)[0])
+    rep = report(server.expect(wav, bpm=130))
     print(f"    events at bars {rep['surprise_events_at_bars']}; moments: {rep['big_moments'][:1]}")
     check(9 in rep["surprise_events_at_bars"], "expect: the quiet-intro -> loud change at bar 9 is a surprise")
 
@@ -186,14 +191,15 @@ def run_time_tests():
     part = [s.surprise for s in ex.run(E, M, upto=8)]
     check(np.allclose(full[:8], part), "surprise is causal: bars 1-8 score the same whether or not later bars exist")
 
-    r1 = json.loads(server.listen_live(wav, bpm=130, bars=8, restart=True)[0])
-    r2 = json.loads(server.listen_live(wav, bpm=130, bars=8, my_guess="it gets louder at bar 9")[0])
+    r1 = report(server.listen_live(wav, bpm=130, bars=8))
+    r2 = report(server.listen_live(wav, bpm=130, session_id=r1["session_id"], bars=8,
+                                   my_guess="it gets louder at bar 9"))
     check(r1["heard"].startswith("bars 1-8") and r2["heard"].startswith("bars 9-16")
           and r2["your_guess_for_these_bars"] == "it gets louder at bar 9" and "bar 9" in r2["what_happened"],
           "listen_live steps 1-8 then 9-16 and reports the bar-9 surprise")
 
-    sl = json.loads(server.sounds_like(wav, bpm=130, against=[str(TEST_DIR / "synthetic_130_Gmaj_v2.wav"),
-                                                                str(TEST_DIR / "synthetic_chords_130.wav")]))
+    sl = report(server.sounds_like(wav, bpm=130, against=[str(TEST_DIR / "synthetic_130_Gmaj_v2.wav"),
+                                                            str(TEST_DIR / "synthetic_chords_130.wav")]))
     check(sl["whole_track_closest"][0].startswith("synthetic_130_Gmaj_v2"),
           f"sounds_like ranks the near-copy first ({sl['whole_track_closest']})")
 
@@ -232,7 +238,7 @@ def run_game_tests():
     sf.write(gpath, game, 48000, subtype="PCM_24")
     side = TEST_DIR / "fake_game_capture.markers.json"
     side.unlink(missing_ok=True)
-    rep = json.loads(server.levels(str(gpath))[0])
+    rep = report(server.levels(str(gpath)))
     lv = rep["levels"]
     print(f"    auto split: {[(l['label'], l['from'], l['bed'], l['lufs'], l.get('change_db')) for l in lv]}")
     check(len(lv) == 3 and "silences" in rep["split_by"], "levels splits a capture on the silences between levels")
@@ -242,13 +248,13 @@ def run_game_tests():
           "music level ignores loud sound effects (integrated LUFS doesn't)")
     side.write_text(json.dumps({"markers": [{"t": 0.0, "label": "forest"}, {"t": 22.0, "label": "cave"},
                                             {"t": 44.0, "label": "castle"}]}))
-    rep = json.loads(server.levels(str(gpath))[0])
+    rep = report(server.levels(str(gpath)))
     check([l["label"] for l in rep["levels"]] == ["forest", "cave", "castle"], "levels uses saved capture markers")
     import soundfile as _sf
     dur = _sf.info(str(gpath)).duration
     side.write_text(json.dumps({"markers": [{"t": 0.0, "label": "forest"}, {"t": 22.0, "label": "cave"},
                                             {"t": 44.0, "label": "castle"}, {"t": dur - 1.0, "label": "tail"}]}))
-    rep = json.loads(server.levels(str(gpath))[0])
+    rep = report(server.levels(str(gpath)))
     tail = rep["levels"][-1]
     check(tail["label"] == "tail" and tail.get("unreliable") and tail["change_db"] is None
           and not any(v.startswith("tail:") and "turn" in v for v in rep["verdict"]),
@@ -259,7 +265,7 @@ def run_game_tests():
     fdir.mkdir(exist_ok=True)
     for name, g in (("level1.wav", -20), ("level2.wav", -14), ("level3.wav", -20)):
         sf.write(fdir / name, _bed(10, g, 7), 48000)
-    rep = json.loads(server.levels(str(fdir))[0])
+    rep = report(server.levels(str(fdir)))
     ch = {l["label"]: l["change_db"] for l in rep["levels"]}
     check(abs(ch["level2.wav"] + 6) < 0.3 and abs(ch["level1.wav"]) < 0.3,
           f"folder mode: one file per level, gain to match ({ch})")
@@ -272,19 +278,19 @@ def run_game_tests():
     shutil.rmtree(TEST_DIR / "captures", ignore_errors=True)
     os.environ["EARS_CAPTURE_DIR"] = str(TEST_DIR / "captures")
     try:
-        st = json.loads(server.capture(action="start", name="selftest", max_minutes=1, hotkey="ctrl+alt+f12"))
+        st = report(server.capture(action="start", name="selftest", max_minutes=1, hotkey="ctrl+alt+f12"))
     except Exception as exc:
         check(False, f"capture start (needs an audio output device): {exc}")
         return
     time.sleep(1.5)
-    mk = json.loads(server.capture(action="mark", label="level 2"))
+    mk = report(server.capture(action="mark", label="level 2"))
     time.sleep(1.0)
-    st2 = json.loads(server.capture(action="status"))
+    st2 = report(server.capture(action="status"))
     out = server.capture(action="stop")
-    rep = json.loads(out[0])
+    rep = report(out)
     print(f"    capture: started {st['elapsed']}, marker at {mk['at']}, status {st2['elapsed']}, hotkey: {st2['hotkey']}")
     check(st2["recording"] and os.path.isfile(rep["recording"]) and rep["recording"].endswith(".flac")
-          and rep["markers"] == 1 and len(out) == 2,
+          and rep["markers"] == 1 and len(out.content) == 2,
           f"capture start/mark/status/stop records a FLAC with the marker ({rep['length']})")
     os.environ.pop("EARS_CAPTURE_DIR")
 
@@ -299,8 +305,9 @@ def run_unit_tests():
     t0 = time.time()
     res = server.listen(str(wav))  # no bpm given: tempo must be detected
     took = time.time() - t0
-    rep = json.loads(res[0])
-    print(f"  listen() took {took:.1f} s; JSON {len(res[0])} chars; content = {[type(c).__name__ for c in res]}")
+    rep = report(res)
+    print(f"  listen() took {took:.1f} s; JSON {len(res.content[0].text)} chars; "
+          f"content = {[type(c).__name__ for c in res.content]}")
     show = {k: rep[k] for k in ("tempo", "key", "loudness", "stereo", "flags", "sections")}
     print("  report (excerpt):")
     for k, v in show.items():
@@ -322,8 +329,9 @@ def run_unit_tests():
 
     print("\n== 2. Given bpm + zoom range")
     res = server.listen(str(wav), bpm=130, start_sec=12, end_sec=22)
-    rep2 = json.loads(res[0])
-    check(len(res) == 3 and rep2["tempo"]["source"] == "given", f"zoom image returned ({rep2['range']['span']})")
+    rep2 = report(res)
+    check(len(res.content) == 3 and rep2["tempo"]["source"] == "given",
+          f"zoom image returned ({rep2['range']['span']})")
 
     print("\n== 3. MP3 + FLAC decoding")
     x, _ = sf.read(str(wav), dtype="float32")
@@ -334,14 +342,14 @@ def run_unit_tests():
         except Exception as exc:
             check(False, f"could write test {ext}: {exc}")
             continue
-        r = json.loads(server.listen(str(p), bpm=130)[0])
+        r = report(server.listen(str(p), bpm=130))
         check(r["format"]["sr"] == SR and abs(r["tempo"]["detected"] - 130) <= 1, f"{ext} decodes (detected {r['tempo']['detected']} BPM)")
 
     print("\n== 4. compare(): B has +sub, +chord, no clip, 4 extra bars")
     wav_b = TEST_DIR / "synthetic_130_Gmaj_v2.wav"
     synth(wav_b, extra_bars=4, sub_gain=1.6, chord_gain=1.4, clip=False)
     res = server.compare(str(wav), str(wav_b), bpm=130)
-    cmp_ = json.loads(res[0])
+    cmp_ = report(res)
     for line in cmp_["summary"]:
         print("    - " + line)
     s = " ".join(cmp_["summary"])
@@ -360,46 +368,64 @@ def run_unit_tests():
         except (PermissionError, ValueError) as exc:
             check(True, f"rejects {bad} -> {type(exc).__name__}")
 
+    spaced = TEST_DIR / "name  with  spaces.wav"
+    sf.write(spaced, np.zeros((SR, 1), np.float32), SR)
+    found = report(server.find_audio("name  with", str(TEST_DIR)))
+    check(found["files"][0]["path"] == str(spaced), "find_audio preserves paths containing repeated spaces")
+
 
 async def run_mcp_test():
-    from mcp import ClientSession, StdioServerParameters
-    from mcp.client.stdio import stdio_client
+    from mcp import Client, StdioServerParameters
 
-    print("\n== 6. End-to-end over MCP stdio (how Claude will call it)")
+    print("\n== 6. End-to-end over MCP stdio (client-neutral contract)")
     params = StdioServerParameters(command=sys.executable, args=[str(ROOT / "ears_server.py")],
                                    env={**os.environ, "EARS_ALLOWED_ROOTS": ROOTS,
                                         "EARS_CAPTURE_DIR": str(TEST_DIR / "captures")})
-    async with stdio_client(params) as (read, write):
-        async with ClientSession(read, write) as session:
-            await session.initialize()
-            tools = sorted(t.name for t in (await session.list_tools()).tools)
-            check(tools == ["capture", "compare", "describe", "expect", "find_audio", "levels", "listen",
-                            "listen_live", "notes", "sounds_like", "stems"], f"tools listed: {tools}")
+    async with Client(params, mode="legacy", read_timeout_seconds=20) as client:
+            listed = (await client.list_tools()).tools
+            tools = sorted(t.name for t in listed)
+            check(tools == ["audio_clip", "capabilities", "capture", "compare", "describe", "expect",
+                            "find_audio", "levels", "listen", "listen_live", "notes", "sounds_like", "stems"],
+                  f"tools listed: {tools}")
+            check(all(t.output_schema for t in listed), "every tool advertises structured output")
             t0 = time.time()
-            res = await session.call_tool("listen", {"path": str(TEST_DIR / "synthetic_130_Gmaj.wav"), "bpm": 130})
+            res = await client.call_tool("listen", {"path": str(TEST_DIR / "synthetic_130_Gmaj.wav"), "bpm": 130})
             kinds = [c.type for c in res.content]
             img = next((c for c in res.content if c.type == "image"), None)
-            check(not getattr(res, "is_error", False) and kinds[:2] == ["text", "image"],
+            check(not getattr(res, "is_error", False) and kinds[:2] == ["text", "image"]
+                  and res.structured_content["tempo"]["source"] == "given",
                   f"listen over MCP returns text + image ({kinds}, {time.time() - t0:.1f} s, image {len(img.data) * 3 // 4 // 1024 if img else 0} KB)")
-            res = await session.call_tool("listen", {"path": r"C:\Windows\win.ini"})
+            res = await client.call_tool("listen", {"path": r"C:\Windows\win.ini"})
             msg = res.content[0].text if res.content else ""
             check(getattr(res, "is_error", False), f"outside path rejected over MCP: {msg[:90]}")
             if HAVE_NOTES:
-                res = await session.call_tool("notes", {"path": str(TEST_DIR / "synthetic_chords_130.wav"),
+                res = await client.call_tool("notes", {"path": str(TEST_DIR / "synthetic_chords_130.wav"),
                                                         "bpm": 130, "stem": "mix"})
                 txt = res.content[0].text if res.content else ""
                 check(not getattr(res, "is_error", False) and [c.type for c in res.content] == ["text", "image"]
                       and "| Am | F | C | G | x2" in txt, "notes over MCP returns the chord chart + piano roll")
-            res = await session.call_tool("find_audio", {"query": "synthetic", "folder": str(TEST_DIR)})
-            check("synthetic_130_Gmaj" in res.content[0].text, "find_audio finds the test files")
+            res = await client.call_tool("find_audio", {"query": "synthetic", "folder": str(TEST_DIR)})
+            files = res.structured_content["files"]
+            check(any("synthetic_130_Gmaj" in f["path"] for f in files)
+                  and all(isinstance(f["size_bytes"], int) for f in files),
+                  "find_audio returns structured file records")
+            res = await client.call_tool("capabilities", {})
+            check(res.structured_content["features"]["audio_clip"]["available"],
+                  "capabilities reports installed core features")
+            res = await client.call_tool("audio_clip", {
+                "path": str(TEST_DIR / "synthetic_130_Gmaj.wav"), "start_sec": 0, "end_sec": 3,
+            })
+            check(not res.is_error and [c.type for c in res.content] == ["text", "audio"]
+                  and res.structured_content["range_sec"]["duration"] == 3,
+                  "audio_clip returns a bounded standard AudioContent excerpt")
             if not HAVE_CAPTURE:
                 return
-            res = await session.call_tool("capture", {"action": "start", "name": "mcp selftest", "hotkey": "ctrl+alt+f11"})
+            res = await client.call_tool("capture", {"action": "start", "name": "mcp selftest", "hotkey": "ctrl+alt+f11"})
             ok = not getattr(res, "is_error", False)
             await asyncio.sleep(1.5)
-            await session.call_tool("capture", {"action": "mark", "label": "level 2"})
+            await client.call_tool("capture", {"action": "mark", "label": "level 2"})
             await asyncio.sleep(1.0)
-            res = await session.call_tool("capture", {"action": "stop"})
+            res = await client.call_tool("capture", {"action": "stop"})
             txt = res.content[0].text if res.content else ""
             check(ok and not getattr(res, "is_error", False) and '"markers":1' in txt
                   and [c.type for c in res.content] == ["text", "image"],
@@ -434,7 +460,8 @@ def main():
     else:
         skip("describe / expect / listen_live / sounds_like tests (install requirements-stems.txt + requirements-describe.txt)")
     run_game_tests()
-    asyncio.run(run_mcp_test())
+    if not os.environ.get("EARS_SKIP_MCP_TEST"):
+        asyncio.run(run_mcp_test())
     passed = sum(ok for ok, _ in RESULTS)
     print(f"\n{passed}/{len(RESULTS)} checks passed")
     sys.exit(0 if passed == len(RESULTS) else 1)

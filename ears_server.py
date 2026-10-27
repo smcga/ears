@@ -1,4 +1,4 @@
-"""Launcher for the ears MCP server (stdio). Point Claude at: .venv\\Scripts\\python.exe ears_server.py"""
+"""Compatibility launcher for the ears MCP server over stdio."""
 import os
 import sys
 
