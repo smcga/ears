@@ -1,6 +1,21 @@
-# ears: lets Claude "listen" to your bounces
+# ears
 
-A local MCP server that measures audio files in your music folder and reports back in plain English, plus a spectrogram image Claude can look at. It measures; it doesn't hear.
+Local audio analysis for any AI client that supports local [Model Context Protocol](https://modelcontextprotocol.io/) tools over stdio.
+
+Ears turns audio files into measurements, musical structure, learned descriptions and visualisations that a language model can reason about. Every tool returns a text report plus structured MCP data. Image-capable clients also receive spectrograms; audio-capable clients can receive an explicitly requested short excerpt.
+
+Ears is a sensory layer, not an LLM. Most tools measure or classify audio locally; they do not reproduce human hearing or decide whether music is good.
+
+## Compatibility
+
+| Capability | Requirement |
+|---|---|
+| Text and structured reports | Any local stdio MCP client |
+| Spectrograms and piano rolls | Client/model support for MCP `ImageContent`; text remains available without it |
+| Short source-audio excerpts | Client/model support for MCP `AudioContent`; only sent when `audio_clip` is called |
+| Core file analysis | Windows, macOS or Linux; Python 3.12 or 3.13 |
+| System-audio capture | Windows 10/11 only |
+| FL Studio bar/note conventions | Optional workflow convention, not a protocol requirement |
 
 ## Tools
 
@@ -12,15 +27,17 @@ A local MCP server that measures audio files in your music folder and reports ba
 | `notes(path, bpm?, stem?, bars?, quantize?)` | Basic Pitch transcription of a stem (default `other` = chords/melody; also `bass`, `vocals`, `mix`): chord chart per bar, bass roots, key from the notes, a beat.step note list for a bar range, a piano-roll image, and tempo-mapped `.mid` files in `<name>_stems\` | ~20 s (+ stem split the first time) |
 | `describe(path, bpm?, phrases?)` | CLAP tags in words: genre/style, groove, texture, elements, mood, for the whole track and per section; optionally scores your own phrases ("garage-ish", "swung") | ~10 s (+ ~10 s model load on first call) |
 | `expect(path, bpm?)` | Listening as prediction: guesses every bar from the bars before it and measures the surprise. Biggest moments (what was expected, what happened, on/off the phrase grid, bars to settle), predictable stretches, which parts return, plus a learned similarity map with the surprise curve | ~10 s |
-| `listen_live(path, bpm?, bars?, my_guess?)` | Step through a track a few bars at a time without seeing ahead. Each step shows what was just heard, your previous guess next to the predictor's forecast and what happened, and a spectrogram with the future greyed out | a few s per step |
+| `listen_live(path, bpm?, session_id?, bars?, my_guess?)` | Step through a track a few bars at a time without seeing ahead. The first call returns an explicit session handle for later calls | a few s per step |
 | `sounds_like(path, against? or folder?)` | Describes each section by the closest-sounding section in your other tracks (learned CLAP fingerprints) instead of adjectives | ~15 s per new reference, then cached |
-| `capture(action, ...)` | Records what Windows is playing (Windows only), e.g. a game while you play it. `start`, then press **Ctrl+Alt+M** in-game as each level starts (or tell Claude to `mark`); `status` = live readout ("level 3 is running +4 dB vs the earlier levels"); `snapshot` = save the last 30 s so Claude can `listen`/`describe` what's playing now; `stop` = per-level loudness report + timeline | live; report in a few s |
+| `audio_clip(path, start_sec?, end_sec?)` | Returns an explicitly requested excerpt of at most 15 seconds as standard MCP audio, with a text fallback and privacy warning | <1 s |
+| `capabilities()` | Reports installed optional features, platform support, allowed folders and persistence settings | <1 s |
+| `capture(action, ...)` | Records what Windows is playing (Windows only), e.g. a game while you play it. `start`, then press **Ctrl+Alt+M** in-game as each level starts (or ask your assistant to `mark`); `status` = live readout; `snapshot` = save the last 30 s for analysis; `stop` = per-level loudness report + timeline | live; report in a few s |
 | `levels(path, splits?, labels?, target_lufs?)` | Loudness per level: a capture split by its markers (or by silences, or your times), or a **folder** of music files (one per level). Gives each level's music level, the dB change and linear volume (e.g. for a Unity AudioSource) to match the others or a target | ~1 s per minute of audio |
 | `find_audio(query, folder?)` | Finds bounces by name, newest first | <1 s |
 
 Bar numbers match FL Studio's playlist **if the bounce starts at bar 1**. Pass `bpm` (e.g. 130) for exact bars.
 
-## Things to say to Claude
+## Things to ask your AI client
 
 - "Listen to C:\Users\me\Music\My Project\my_track.mp3 at 130 bpm"
 - "Compare my_track.mp3 and my_track_v2.mp3 in my Music folder: what changed?"
@@ -31,6 +48,7 @@ Bar numbers match FL Studio's playlist **if the bounce starts at bar 1**. Pass `
 - "Describe my_track. Does it come across as garage-ish or more techno? Is the groove swung?"
 - "Run expect on my_track at 130 bpm: where does it break expectations?"
 - "Listen to my_track live, 8 bars at a time, and tell me what you expect before each step"
+- "Send bars 33-40 as a short audio clip so you can listen directly" (audio-capable clients only)
 - "What does my_new_idea sound like among my other bounces?"
 - "Find my latest bounce and check it for clipping"
 - "Listen to my game while I play. I'll press Ctrl+Alt+M at each new level" ... "how's this level compared to the others?" ... "stop: which levels need turning up or down?"
@@ -38,6 +56,8 @@ Bar numbers match FL Studio's playlist **if the bounce starts at bar 1**. Pass `
 - "Compare the loudness of the music files in my Game music folder"
 
 Note names follow FL Studio's piano roll (middle C = C5). The saved MIDI is at your BPM in 4/4 and snapped to 1/16, so dragging it into FL at bar 1 lines it up with the bounce.
+
+`listen_live` returns a `session_id`. Clients must pass that handle into each later call so independent conversations cannot affect one another.
 
 ### Game captures, what to know
 
@@ -49,55 +69,93 @@ Note names follow FL Studio's piano roll (middle C = C5). The saved MIDI is at y
 
 ## Install
 
-Windows 10/11 and Python 3.12. From the folder you cloned ears into:
+Clone the repository, then install the core server into a virtual environment:
 
-```
+```powershell
+# Windows
 py -3.12 -m venv .venv
-.venv\Scripts\python.exe -m pip install -r requirements.txt
-.venv\Scripts\python.exe -m pip install -r requirements-stems.txt      # optional: stems tool, ~2.5 GB
-.venv\Scripts\python.exe -m pip install -r requirements-notes.txt      # optional: notes tool
+.venv\Scripts\python.exe -m pip install -e .
+```
+
+```bash
+# macOS / Linux
+python3.12 -m venv .venv
+.venv/bin/python -m pip install -e .
+```
+
+This installs the `ears-mcp` command. MP3 decoding uses libsndfile through `soundfile`, so ffmpeg is not required.
+
+### Optional features
+
+```powershell
+# CPU stems and CLAP descriptions
+.venv\Scripts\python.exe -m pip install -e ".[stems-cpu,describe-cpu]"
+
+# NVIDIA CUDA 12.4 stems, then CLAP descriptions
+.venv\Scripts\python.exe -m pip install -r requirements-stems.txt
+.venv\Scripts\python.exe -m pip install -r requirements-describe.txt
+
+# Basic Pitch note/MIDI transcription
+.venv\Scripts\python.exe -m pip install -r requirements-notes.txt
 .venv\Scripts\python.exe -m pip install --no-deps basic-pitch==0.4.0
-.venv\Scripts\python.exe -m pip install -r requirements-describe.txt   # optional: describe tool
-.venv\Scripts\python.exe -m pip install -r requirements-capture.txt    # optional: capture tool
+
+# Windows system-audio capture
+.venv\Scripts\python.exe -m pip install -e ".[capture]"
 ```
 
-`basic-pitch` must go in with `--no-deps`: it declares an old TensorFlow that doesn't exist for Python 3.12 on Windows, and ears uses its bundled ONNX model instead (see `requirements-notes.txt`). `requirements.lock.txt` lists the exact versions ears was tested with.
+`basic-pitch` is installed with `--no-deps` because its declared TensorFlow dependency is incompatible with the supported Windows/Python combination; Ears uses its bundled ONNX model. `requirements.lock.txt` records the complete environment used during development.
 
-MP3 decoding uses libsndfile (bundled with `soundfile`), so ffmpeg isn't needed.
+The first CLAP call downloads approximately 1.3 GB of pinned model weights from Hugging Face. Later analysis is local. Use `capabilities()` to see what is available on the current installation.
 
-## Register with Claude
+## Connect an MCP client
 
-Replace `C:\path\to\ears` with where you cloned ears, and `C:\Users\me\Music` with the folder that holds your audio.
-
-Claude Code:
-
-```
-claude mcp add ears --scope user -e EARS_ALLOWED_ROOTS=C:\Users\me\Music -- C:\path\to\ears\.venv\Scripts\python.exe C:\path\to\ears\ears_server.py
-```
-
-Claude Desktop (Settings > Developer > Edit Config, then restart Claude Desktop):
+Ears speaks standard MCP over stdio. Configure your client to run `ears-mcp` and set the folders it may read:
 
 ```json
-"mcpServers": {
-  "ears": {
-    "command": "C:\\path\\to\\ears\\.venv\\Scripts\\python.exe",
-    "args": ["C:\\path\\to\\ears\\ears_server.py"],
-    "env": { "EARS_ALLOWED_ROOTS": "C:\\Users\\me\\Music" }
+{
+  "mcpServers": {
+    "ears": {
+      "command": "C:\\path\\to\\ears\\.venv\\Scripts\\ears-mcp.exe",
+      "env": {
+        "EARS_ALLOWED_ROOTS": "C:\\Users\\me\\Music"
+      }
+    }
   }
 }
 ```
 
-## Settings (env vars in the config above)
+On macOS/Linux, the command is normally `/path/to/ears/.venv/bin/ears-mcp`. Client configuration formats differ, but the command, environment and stdio transport are the same. Claude Desktop, Claude Code, Codex, Cursor, Gemini CLI, VS Code and other MCP hosts can all use the server when they support local stdio tools.
 
-- `EARS_ALLOWED_ROOTS`: folders ears may read, separated by `;` (default: the `Music` folder in your user profile). Anything else is refused.
-- `EARS_OUTPUT_DIR`: where images are saved (default `output\` in the ears folder).
-- `EARS_CAPTURE_DIR`: where game captures go (default `<first allowed folder>\ears captures`; must be inside an allowed folder).
-- `EARS_MARK_HOTKEY`: the in-game marker hotkey (default `ctrl+alt+m`).
+Clients that do not forward images or audio to their model still receive the complete text and structured report.
+
+## Settings
+
+- `EARS_ALLOWED_ROOTS`: folders Ears may read. Separate paths with `;` on Windows or `:` on macOS/Linux. A JSON array of paths is also accepted. Default: the current user's `Music` folder.
+- `EARS_SAVE_OUTPUTS`: set to `1` to save generated images as well as returning them inline. Default: off.
+- `EARS_OUTPUT_DIR`: saved-image folder when `EARS_SAVE_OUTPUTS=1`. Default: `output/` in the repository.
+- `EARS_CACHE_DIR`: opt-in persistent cache for learned CLAP fingerprints. Without it, the cache is memory-only.
+- `EARS_CAPTURE_DIR`: Windows capture folder. Default: `<first allowed folder>/ears captures`; it must remain inside an allowed root.
+- `EARS_MARK_HOTKEY`: Windows in-game marker hotkey. Default: `ctrl+alt+m`.
+
+## Privacy and side effects
+
+- Core analysis is local and does not upload source audio.
+- `describe`, `expect`, `listen_live` and `sounds_like` may download pinned CLAP weights from Hugging Face on first use.
+- `audio_clip` returns source audio to the MCP client. The client may transmit it to its configured model provider, so the tool should only be called at the user's explicit request.
+- `stems` writes WAV files next to the source; `notes` writes MIDI; `capture` writes recordings and marker files.
+- Generated images are returned inline and are only saved when `EARS_SAVE_OUTPUTS=1`.
 
 ## Self-test
 
-```
+```powershell
 .venv\Scripts\python.exe tests\selftest.py
+.venv\Scripts\python.exe tests\contract_test.py
 ```
 
-Builds a synthetic 130 BPM track (kick, 45 Hz sub, G major chord, quiet 8-bar intro, one clipped peak) and checks tempo, key, the bar-9 section change, clipping and the sub flag. It also checks MP3/FLAC decoding, `compare`, the folder guard, `notes` on a synthetic Am-F-C-G progression (chords, bass roots, MIDI), per-level loudness on a fake three-level game capture (including one with loud sound effects), a short silent system-audio capture, and a real MCP round trip. The optional tools' checks are skipped if their packages aren't installed.
+The synthetic-audio suite checks tempo, key, sections, clipping, MP3/FLAC decoding, comparison, path safety and game-level loudness. Optional model-backed checks run when their packages are installed. The contract test starts the real stdio server, verifies every tool has an output schema, checks structured results and exercises standard MCP audio content.
+
+GitHub Actions runs the core suite on Windows and Linux with Python 3.12 and 3.13.
+
+## Licence
+
+MIT. See [LICENSE](LICENSE).

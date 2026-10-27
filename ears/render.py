@@ -10,17 +10,18 @@ from matplotlib.figure import Figure
 from matplotlib.ticker import FuncFormatter, MultipleLocator
 
 from .analysis import Analysis, Grid, mmss
+from .paths import save_outputs_enabled
 
 TICK_HZ = [30, 60, 100, 250, 500, 1000, 2000, 5000, 10000, 16000]
 SECTION_COLOR = "#38e0ff"
-MAX_BYTES = 900_000
+MAX_BYTES = 650_000
 
 
 def _hz(f: float) -> str:
     return f"{f / 1000:g}k" if f >= 1000 else f"{f:g}"
 
 
-def _save(fig: Figure, out_path) -> tuple[bytes, str, str]:
+def _save(fig: Figure, out_path) -> tuple[bytes, str, str | None]:
     FigureCanvasAgg(fig)
     buf = io.BytesIO()
     fig.savefig(buf, format="png")
@@ -29,9 +30,11 @@ def _save(fig: Figure, out_path) -> tuple[bytes, str, str]:
         buf = io.BytesIO()
         fig.savefig(buf, format="jpeg", pil_kwargs={"quality": 88})
         data, fmt = buf.getvalue(), "jpeg"
-    path = str(out_path.with_suffix(".png" if fmt == "png" else ".jpg"))
-    with open(path, "wb") as fh:
-        fh.write(data)
+    path = None
+    if save_outputs_enabled():
+        path = str(out_path.with_suffix(".png" if fmt == "png" else ".jpg"))
+        with open(path, "wb") as fh:
+            fh.write(data)
     return data, fmt, path
 
 

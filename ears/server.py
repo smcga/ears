@@ -1,39 +1,51 @@
-"""ears: an MCP server that lets Claude 'listen' to audio bounces by measuring them."""
+"""ears: local audio analysis for any MCP-compatible AI client."""
 from __future__ import annotations
 
 import functools
+import importlib.util
+import io
 import json
 import os
+import platform
 import re
+import secrets
 import sys
 import threading
 import time
 import traceback
 from collections import OrderedDict
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 import numpy as np
 
-from mcp.server.mcpserver import Image, MCPServer
+from mcp.server.mcpserver import Audio, Image, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
-from mcp.types import ToolAnnotations
+from mcp.types import CallToolResult, TextContent, ToolAnnotations
 from pydantic import Field
 
-from .paths import allowed_roots, find_audio as _find_audio, output_dir, resolve_audio_path
+from .paths import (
+    allowed_roots,
+    find_audio as _find_audio,
+    output_dir,
+    resolve_audio_path,
+    save_outputs_enabled,
+)
 
 INSTRUCTIONS = (
-    "ears measures audio files (FL Studio bounces) under the user's music folder. "
+    "ears measures audio files under folders the user has allowed. "
     "Use `listen` for one file, `compare` for two versions, `stems` to split into stems (slow), "
     "`notes` to transcribe notes/chords to MIDI (Basic Pitch), `describe` for genre/mood/texture tags (CLAP), "
     "`expect` for a bar-by-bar surprise map (listening as prediction), `listen_live` to step through a track without "
     "seeing ahead (write your own prediction before each call), `sounds_like` to compare against the user's other tracks, "
-    "`find_audio` to locate files by name. "
+    "`find_audio` to locate files by name, and `capabilities` to check optional features. "
     "`capture` records what the computer is playing (e.g. a game while the user plays: start, mark each new level, "
     "status for live levels, snapshot to grab the last seconds, stop for a per-level loudness report); `levels` "
     "compares loudness per level for a recording or per file for a folder of level music. "
     "Bar numbers follow FL Studio's playlist (bar 1 = start of file); "
-    "pass `bpm` when the user gives the project tempo. Results are measurements, not hearing: "
-    "say so, call out low-confidence key/tempo, and look at the spectrogram image before describing the track."
+    "pass `bpm` when the user gives the project tempo. Results are measurements, not human hearing: "
+    "say so and call out low-confidence key/tempo. Use returned spectrograms when the client exposes images; "
+    "otherwise rely on the text report and say that visual inspection was unavailable. Only call `audio_clip` "
+    "when the user explicitly asks to send a short excerpt to an audio-capable model."
 )
 
 mcp = MCPServer("ears", instructions=INSTRUCTIONS, log_level="WARNING")
@@ -60,7 +72,7 @@ def _analysis(real: str, bpm: float | None):
 
 
 def friendly(fn):
-    """Turn exceptions into ToolErrors so Claude sees the actual message (mcp v2 hides other errors)."""
+    """Turn expected failures into messages any calling model can act on."""
 
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
@@ -81,23 +93,37 @@ def _dump(obj) -> str:
     return json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
 
 
+ReportResult = Annotated[CallToolResult, dict[str, Any]]
+
+
+def _result(report: dict[str, Any], images: list[tuple[bytes, str]] | None = None,
+            audio: tuple[bytes, str] | None = None) -> CallToolResult:
+    """Return the same report for models and applications, plus optional standard MCP media."""
+    content = [TextContent(type="text", text=_dump(report))]
+    for data, fmt in images or []:
+        content.append(Image(data=data, format=fmt).to_image_content())
+    if audio:
+        content.append(Audio(data=audio[0], format=audio[1]).to_audio_content())
+    return CallToolResult(content=content, structured_content=report)
+
+
 def _stem(path: str) -> str:
     return os.path.splitext(os.path.basename(path))[0]
 
 
-PathArg = Annotated[str, Field(description=r"Full path to a .wav/.mp3/.flac file, e.g. C:\Users\me\Music\My Project\my_track.mp3")]
+PathArg = Annotated[str, Field(description="Absolute path to an allowed .wav/.mp3/.flac/.aiff/.ogg file.")]
 BpmArg = Annotated[float | None, Field(description="Project tempo in BPM if known (e.g. 130). Omit to auto-detect.", ge=40, le=300)]
 
 
-@mcp.tool(annotations=ToolAnnotations(title="Listen to a track", readOnlyHint=True, openWorldHint=False),
-          structured_output=False)
+@mcp.tool(annotations=ToolAnnotations(title="Listen to a track", readOnlyHint=not save_outputs_enabled(),
+                                      destructiveHint=False, idempotentHint=True, openWorldHint=False))
 @friendly
 def listen(
     path: PathArg,
     bpm: BpmArg = None,
     start_sec: Annotated[float | None, Field(description="Optional: start of a range to zoom into (seconds).", ge=0)] = None,
     end_sec: Annotated[float | None, Field(description="Optional: end of the zoom range (seconds).", gt=0)] = None,
-):
+) -> ReportResult:
     """Analyse an audio bounce and return a compact listening report plus a spectrogram image.
 
     Report: duration/format, tempo + beat confidence, key estimate (with runner-up and confidence),
@@ -125,27 +151,24 @@ def listen(
     out = output_dir()
     img, fmt, img_path = render.overview(a, out / f"{_stem(real)}_overview")
     report = listen_report(a, img_path, rng)
-    content: list = []
     zoom = None
     if rng:
         zoom = render.zoom(a, rng, out / f"{_stem(real)}_zoom_{int(rng['_spec']['t0'])}-{int(rng['_spec']['t1'])}s")
-        report["zoom_image_saved"] = zoom[2]
+        if zoom[2]:
+            report["zoom_image_saved"] = zoom[2]
     report["took_sec"] = round(time.time() - t0, 1)
-    content.append(_dump(report))
-    content.append(Image(data=img, format=fmt))
-    if zoom:
-        content.append(Image(data=zoom[0], format=zoom[1]))
-    return content
+    images = [(img, fmt)] + ([(zoom[0], zoom[1])] if zoom else [])
+    return _result(report, images)
 
 
-@mcp.tool(annotations=ToolAnnotations(title="Compare two versions", readOnlyHint=True, openWorldHint=False),
-          structured_output=False)
+@mcp.tool(annotations=ToolAnnotations(title="Compare two versions", readOnlyHint=not save_outputs_enabled(),
+                                      destructiveHint=False, idempotentHint=True, openWorldHint=False))
 @friendly
 def compare(
     path_a: Annotated[str, Field(description="Full path to version A (the older one), e.g. ...\\my_track.mp3")],
     path_b: Annotated[str, Field(description="Full path to version B (the newer one), e.g. ...\\my_track_v2.mp3")],
     bpm: BpmArg = None,
-):
+) -> ReportResult:
     """Compare two versions of a track (e.g. my_track.mp3 vs my_track_v2.mp3) on the same FL bar grid.
 
     Returns a plain-English summary of what changed (length, loudness, peaks/clipping, key, tempo,
@@ -165,18 +188,17 @@ def compare(
     img, fmt, img_path = render.compare_pair(a, b, out / f"compare_{_stem(ra)}_vs_{_stem(rb)}")
     rep = compare_report(a, b, img_path)
     rep["took_sec"] = round(time.time() - t0, 1)
-    return [_dump(rep), Image(data=img, format=fmt)]
+    return _result(rep, [(img, fmt)])
 
 
-@mcp.tool(annotations=ToolAnnotations(title="Split into stems (slow)", readOnlyHint=False, destructiveHint=False,
-                                      idempotentHint=True, openWorldHint=False),
-          structured_output=False)
+@mcp.tool(annotations=ToolAnnotations(title="Split into stems (slow)", readOnlyHint=False, destructiveHint=True,
+                                      idempotentHint=True, openWorldHint=True))
 @friendly
 def stems(
     path: PathArg,
     bpm: BpmArg = None,
     force: Annotated[bool, Field(description="Re-run separation even if stems already exist.")] = False,
-):
+) -> ReportResult:
     """SLOW: split a track into drums / bass / other / vocals with Demucs (htdemucs) and report on each stem.
 
     Saves 32-bit float WAVs in a '<name>_stems' folder next to the source (re-used next time if the
@@ -210,10 +232,11 @@ def stems(
         "stems": reports,
         "note": ("Demucs is trained on band music: on electronic tracks 'vocals' often catches leads/synths and "
                  "'other' holds pads/chords/FX. Expect some bleed between stems."),
-        "image_saved": img_path,
         "took_sec": round(time.time() - t0, 1),
     }
-    return [_dump(out), Image(data=img, format=fmt)]
+    if img_path:
+        out["image_saved"] = img_path
+    return _result(out, [(img, fmt)])
 
 
 STEM_DESCRIPTIONS = {
@@ -243,8 +266,7 @@ def _detail_range(bars: str | None, a, notes) -> tuple[int, int]:
 
 
 @mcp.tool(annotations=ToolAnnotations(title="Transcribe notes & chords to MIDI", readOnlyHint=False,
-                                      destructiveHint=False, idempotentHint=True, openWorldHint=False),
-          structured_output=False)
+                                      destructiveHint=True, idempotentHint=True, openWorldHint=False))
 @friendly
 def notes(
     path: PathArg,
@@ -256,7 +278,7 @@ def notes(
         description="Bar range for the detailed note list and close-up, e.g. '33-40' (max 16 bars). "
                     "Default: 8 bars from the start of the loudest section.")] = None,
     quantize: Annotated[bool, Field(description="Snap the saved MIDI to 1/16 steps.")] = True,
-):
+) -> ReportResult:
     """Transcribe notes and chords with Basic Pitch and save MIDI that lines up with FL's bars.
 
     Uses Demucs stems (made first if missing: slow the first time, reused after). Transcribes the chosen stem
@@ -343,8 +365,9 @@ def notes(
         "midi_note": (f"Tempo {g.bpm:g} BPM, 4/4{', quantised to 1/16' if quantize else ''}: drop it into FL "
                       f"at bar 1 and it lines up with the bounce ({n_written} notes in the main file)."),
         "limits": tr.LIMITS,
-        "image_saved": img_path,
     }
+    if img_path:
+        rep["image_saved"] = img_path
     if dropped:
         rep["ignored_notes"] = f"{dropped} notes in bars where the stem is near-silent (bleed/reverb) were left out."
     if fallback:
@@ -352,18 +375,18 @@ def notes(
     if sep and not sep.get("reused_existing"):
         rep["stem_separation"] = sep
     rep["took_sec"] = round(time.time() - t0, 1)
-    return [_dump({k: v for k, v in rep.items() if v is not None}), Image(data=img, format=fmt)]
+    return _result({k: v for k, v in rep.items() if v is not None}, [(img, fmt)])
 
 
-@mcp.tool(annotations=ToolAnnotations(title="Describe the vibe (CLAP tags)", readOnlyHint=True, openWorldHint=False),
-          structured_output=False)
+@mcp.tool(annotations=ToolAnnotations(title="Describe the vibe (CLAP tags)", readOnlyHint=False,
+                                      destructiveHint=False, idempotentHint=True, openWorldHint=True))
 @friendly
 def describe(
     path: PathArg,
     bpm: BpmArg = None,
     phrases: Annotated[list[str] | None, Field(
         description="Optional: your own descriptions to score, e.g. ['garage-ish', 'swung', 'gritty bass']. Max 12.")] = None,
-):
+) -> ReportResult:
     """Describe a track in words with CLAP audio-text embeddings: genre/style, groove, texture, elements and mood.
 
     Scores a fixed tag vocabulary for the whole track and per detected section (on FL's bar grid), and optionally
@@ -380,7 +403,7 @@ def describe(
     a = _analysis(real, bpm)
     rep = {"file": a.name, "grid": f"{a.grid.bpm:g} BPM, bar 1 = 0:00", **_describe(a, phrases)}
     rep["took_sec"] = round(time.time() - t0, 1)
-    return _dump(rep)
+    return _result(rep)
 
 
 def _returns(a, E) -> list[str]:
@@ -399,10 +422,10 @@ def _returns(a, E) -> list[str]:
     return out
 
 
-@mcp.tool(annotations=ToolAnnotations(title="Listen as prediction (surprise map)", readOnlyHint=True,
-                                      openWorldHint=False), structured_output=False)
+@mcp.tool(annotations=ToolAnnotations(title="Listen as prediction (surprise map)", readOnlyHint=False,
+                                      destructiveHint=False, idempotentHint=True, openWorldHint=True))
 @friendly
-def expect(path: PathArg, bpm: BpmArg = None):
+def expect(path: PathArg, bpm: BpmArg = None) -> ReportResult:
     """Listen the way prediction works: guess every bar from the bars before it, then measure the surprise.
 
     Returns a surprise value per bar (1 = business as usual, 2.5+ = broke expectation), the biggest moments
@@ -428,27 +451,31 @@ def expect(path: PathArg, bpm: BpmArg = None):
         rep["grid_warning"] = (f"Beats don't sit well on the {a.grid.bpm:g} BPM grid (fit {a.tempo['grid_fit']:.2f}): "
                                "bar numbers and on/off-grid remarks are unreliable. Pass the real bpm if known.")
     img, fmt, img_path = render.structure_map(a, E, steps, output_dir() / f"{_stem(real)}_expect")
-    rep["image_saved"] = img_path
+    if img_path:
+        rep["image_saved"] = img_path
     rep["took_sec"] = round(time.time() - t0, 1)
-    return [_dump(rep), Image(data=img, format=fmt)]
+    return _result(rep, [(img, fmt)])
 
 
 _live: dict[str, dict] = {}
+_live_lock = threading.Lock()
 
 
-@mcp.tool(annotations=ToolAnnotations(title="Listen in time (step through)", readOnlyHint=True,
-                                      openWorldHint=False), structured_output=False)
+@mcp.tool(annotations=ToolAnnotations(title="Listen in time (step through)", readOnlyHint=False,
+                                      destructiveHint=False, idempotentHint=False, openWorldHint=True))
 @friendly
 def listen_live(
     path: PathArg,
     bpm: BpmArg = None,
+    session_id: Annotated[str | None, Field(
+        description="Handle returned by the first call. Pass it on every later call for this listening session.")] = None,
     bars: Annotated[int, Field(description="How many bars to reveal per call.", ge=1, le=32)] = 8,
     my_guess: Annotated[str | None, Field(
         description="Your prediction for the bars about to be revealed (free text). It's echoed back next to "
                     "what actually happened, so you can see where your expectation was right or wrong.")] = None,
     from_bar: Annotated[int | None, Field(description="Start (or jump) to this bar.", ge=1)] = None,
     restart: Annotated[bool, Field(description="Start again from bar 1.")] = False,
-):
+) -> ReportResult:
     """Hear a track in time: each call reveals only the next few bars, never anything after them.
 
     Per call: the newly heard bars (level, what came in/out, which earlier bar each one sounds like, surprise vs
@@ -464,52 +491,71 @@ def listen_live(
     real = resolve_audio_path(path)
     a = _analysis(real, bpm)
     g, n = a.grid, a.grid.n_bars
-    key = os.path.normcase(real)
-    st = _live.get(key)
-    if restart or st is None or from_bar:
-        st = _live[key] = {"pos": from_bar or 1, "forecast": None}
-    if st["pos"] > n:
-        _live.pop(key, None)
-        return _dump({"file": a.name, "done": f"Track finished at bar {n}. Call again (or restart=True) to start over."})
-    E = bar_embeddings(a)
-    M = ex.measured(a)
-    b0, b1 = st["pos"], min(n, st["pos"] + bars - 1)
-    steps = ex.run(E, M, upto=b1)
+    path_key = os.path.normcase(real)
+    with _live_lock:
+        if session_id:
+            st = _live.get(session_id)
+            if st is None:
+                raise ValueError("Unknown or finished listen_live session. Omit session_id to start a new one.")
+            if st["path"] != path_key:
+                raise ValueError("That listen_live session belongs to a different audio file.")
+        else:
+            session_id = secrets.token_urlsafe(12)
+            st = _live[session_id] = {"path": path_key, "pos": from_bar or 1, "forecast": None,
+                                      "lock": threading.Lock()}
+    with st["lock"]:
+        if restart or from_bar:
+            st["pos"], st["forecast"] = from_bar or 1, None
+        if st["pos"] > n:
+            with _live_lock:
+                _live.pop(session_id, None)
+            return _result({"file": a.name, "session_id": session_id,
+                            "done": f"Track finished at bar {n}. Start a new session to listen again."})
+        E = bar_embeddings(a)
+        M = ex.measured(a)
+        b0, b1 = st["pos"], min(n, st["pos"] + bars - 1)
+        steps = ex.run(E, M, upto=b1)
 
-    rows = []
-    for k in range(b0 - 1, b1):
-        s = steps[k]
-        sim = (f"like bar {s.nearest} ({s.nearest_sim:.2f})" if s.nearest and s.nearest_sim >= 0.9
-               else f"new (nearest bar {s.nearest}, {s.nearest_sim:.2f})" if s.nearest else "first bar")
-        sur = "warm-up" if s.bar <= ex.WARMUP else f"surprise {s.surprise:.1f}"
-        rows.append(f"{s.bar} ({_mmss(g.t_of_bar(s.bar))}): {ex.what_changed(M, k)}, now {M[k, 0]:.0f} dB; {sim}; {sur}")
-    evs = [e for e in ex.events(steps) if b0 - 1 <= e[0] <= b1 - 1]
-    happened = ("; ".join(f"bar {steps[i].bar} broke expectation ({p:.1f}): {ex.explain(steps[i], M)}"
-                          for i, _, p in evs)
-                or "No big surprises: it went roughly as the past suggested.")
-    nxt = b1 + 1
-    fc = ex.forecast(a, E, M, steps, nxt, bars) if nxt <= n else None
-    rep = {
-        "file": a.name,
-        "heard": f"bars {b0}-{b1} of {n} ({_mmss(g.t_of_bar(b0))}-{_mmss(min(a.duration, g.t_of_bar(b1 + 1)))})",
-        "your_guess_for_these_bars": my_guess or "(none given)",
-        "model_forecast_was": st["forecast"] or "(no forecast: first chunk)",
-        "what_happened": happened,
-        "bars": rows,
-        "model_forecast_next": fc or "This was the last chunk.",
-        "next": (f"Write your own expectation for bars {nxt}-{min(n, nxt + bars - 1)}, then call listen_live again "
-                 "with my_guess." if nxt <= n else "Track finished."),
-        "honesty": ("Only bars up to the cyan line have been analysed for this view (tempo/grid comes from the whole "
-                    "file). Text and a picture of the sound, delivered in steps; not audio in real time."),
-    }
-    img, fmt, _ = render.live_view(a, steps, b1, output_dir() / f"{_stem(real)}_live",
-                                   (nxt, min(n, nxt + bars - 1)) if nxt <= n else None)
-    st["pos"], st["forecast"] = nxt, fc
-    return [_dump(rep), Image(data=img, format=fmt)]
+        rows = []
+        for k in range(b0 - 1, b1):
+            s = steps[k]
+            sim = (f"like bar {s.nearest} ({s.nearest_sim:.2f})" if s.nearest and s.nearest_sim >= 0.9
+                   else f"new (nearest bar {s.nearest}, {s.nearest_sim:.2f})" if s.nearest else "first bar")
+            sur = "warm-up" if s.bar <= ex.WARMUP else f"surprise {s.surprise:.1f}"
+            rows.append(f"{s.bar} ({_mmss(g.t_of_bar(s.bar))}): {ex.what_changed(M, k)}, "
+                        f"now {M[k, 0]:.0f} dB; {sim}; {sur}")
+        evs = [e for e in ex.events(steps) if b0 - 1 <= e[0] <= b1 - 1]
+        happened = ("; ".join(f"bar {steps[i].bar} broke expectation ({p:.1f}): {ex.explain(steps[i], M)}"
+                              for i, _, p in evs)
+                    or "No big surprises: it went roughly as the past suggested.")
+        nxt = b1 + 1
+        fc = ex.forecast(a, E, M, steps, nxt, bars) if nxt <= n else None
+        rep = {
+            "file": a.name,
+            "session_id": session_id,
+            "heard": f"bars {b0}-{b1} of {n} ({_mmss(g.t_of_bar(b0))}-{_mmss(min(a.duration, g.t_of_bar(b1 + 1)))})",
+            "your_guess_for_these_bars": my_guess or "(none given)",
+            "model_forecast_was": st["forecast"] or "(no forecast: first chunk)",
+            "what_happened": happened,
+            "bars": rows,
+            "model_forecast_next": fc or "This was the last chunk.",
+            "next": (f"Write your own expectation for bars {nxt}-{min(n, nxt + bars - 1)}, then call "
+                     f"listen_live again with session_id='{session_id}' and my_guess."
+                     if nxt <= n else "Track finished."),
+            "honesty": ("Only bars up to the cyan line have been analysed for this view (tempo/grid comes from "
+                        "the whole file). Text and a picture of the sound, delivered in steps; not audio in real time."),
+        }
+        img, fmt, _ = render.live_view(a, steps, b1, output_dir() / f"{_stem(real)}_live",
+                                       (nxt, min(n, nxt + bars - 1)) if nxt <= n else None)
+        st["pos"], st["forecast"] = nxt, fc
+        if nxt > n:
+            with _live_lock:
+                _live.pop(session_id, None)
+        return _result(rep, [(img, fmt)])
 
 
-@mcp.tool(annotations=ToolAnnotations(title="Sounds like (compare to other tracks)", readOnlyHint=True,
-                                      openWorldHint=False), structured_output=False)
+@mcp.tool(annotations=ToolAnnotations(title="Sounds like (compare to other tracks)", readOnlyHint=False,
+                                      destructiveHint=False, idempotentHint=True, openWorldHint=True))
 @friendly
 def sounds_like(
     path: PathArg,
@@ -518,7 +564,7 @@ def sounds_like(
     folder: Annotated[str | None, Field(
         description="Or: compare against the newest audio files in this folder (default: the track's own folder).")] = None,
     max_files: Annotated[int, Field(description="Max reference files (first run takes ~15 s each).", ge=1, le=16)] = 8,
-):
+) -> ReportResult:
     """Describe a track by what it sounds like among your own music, using learned CLAP fingerprints.
 
     For each section, finds the closest-sounding section in the reference tracks, and ranks the references
@@ -536,7 +582,7 @@ def sounds_like(
         refs = [resolve_audio_path(p) for p in against]
     else:
         listing = _fa("", folder or os.path.dirname(real), limit=100)
-        refs = [r.split("  ")[-1].strip() for r in listing["newest_first"]]
+        refs = [r["path"] for r in listing["files"]]
         refs = [resolve_audio_path(r) for r in refs]
     refs = [r for r in refs if os.path.normcase(r) != os.path.normcase(real)][:max_files]
     if not refs:
@@ -560,22 +606,123 @@ def sounds_like(
                            "0.8 = related, below 0.7 = different. It reflects overall sound (timbre, density, "
                            "instrumentation), not melody or key."),
            "took_sec": round(time.time() - t0, 1)}
-    return _dump(rep)
+    return _result(rep)
 
 
-def _level_output(path: str, splits=None, labels=None, target_lufs=None) -> list:
+def _level_output(path: str, splits=None, labels=None, target_lufs=None) -> CallToolResult:
     from . import render
     from .levels import capture_report
 
     rep, plot = capture_report(path, splits, labels, target_lufs)
     img, fmt, img_path = render.level_timeline(plot, output_dir() / f"{_stem(path)}_levels")
-    rep["image"] = img_path
-    return [_dump(rep), Image(data=img, format=fmt)]
+    if img_path:
+        rep["image_saved"] = img_path
+    return _result(rep, [(img, fmt)])
+
+
+def _module_available(*names: str) -> bool:
+    return all(importlib.util.find_spec(name) is not None for name in names)
+
+
+@mcp.tool(annotations=ToolAnnotations(title="Show ears capabilities", readOnlyHint=True, openWorldHint=False))
+@friendly
+def capabilities() -> ReportResult:
+    """Show installed features, platform constraints, allowed folders and persistence settings."""
+    features = {
+        "listen_compare_levels": {"available": True, "network": False},
+        "audio_clip": {"available": True, "network": False, "max_seconds": {"mono": 15, "stereo": 6}},
+        "stems": {
+            "available": _module_available("torch", "demucs"),
+            "network": "May download pretrained Demucs weights on first use if not cached.",
+        },
+        "notes": {"available": _module_available("basic_pitch", "onnxruntime"), "network": False},
+        "describe_expect_sounds_like": {
+            "available": _module_available("torch", "transformers"),
+            "network": "Downloads pinned CLAP model weights from Hugging Face on first use if not cached.",
+        },
+        "capture": {
+            "available": sys.platform == "win32" and _module_available("soundcard", "pycaw", "comtypes"),
+            "platform": "Windows 10/11",
+            "network": False,
+        },
+    }
+    return _result({
+        "server": "ears",
+        "python": platform.python_version(),
+        "platform": platform.platform(),
+        "allowed_roots": allowed_roots(),
+        "features": features,
+        "persistence": {
+            "save_generated_images": save_outputs_enabled(),
+            "output_dir": str(output_dir()) if save_outputs_enabled() else None,
+            "persistent_embedding_cache": os.environ.get("EARS_CACHE_DIR") or None,
+            "note": "Reports and media are returned inline. Disk persistence is opt-in except for stems, MIDI and captures.",
+        },
+    })
+
+
+@mcp.tool(annotations=ToolAnnotations(title="Send a short audio excerpt", readOnlyHint=True, openWorldHint=False))
+@friendly
+def audio_clip(
+    path: PathArg,
+    start_sec: Annotated[float, Field(description="Excerpt start in seconds.", ge=0)] = 0,
+    end_sec: Annotated[float | None, Field(
+        description="Excerpt end in seconds. Default: 12 seconds after start. Max: 15 s mono / 6 s stereo.",
+        gt=0)] = None,
+    channels: Annotated[Literal["mono", "stereo"], Field(
+        description="Mono is smaller and most compatible; stereo preserves spatial information.")] = "mono",
+    sample_rate: Annotated[Literal[16000, 24000], Field(
+        description="Output sample rate. 24 kHz preserves more musical detail; 16 kHz is smaller.")] = 24000,
+) -> ReportResult:
+    """Return a short WAV excerpt as standard MCP AudioContent plus a text fallback.
+
+    Only use this when the user explicitly asks an audio-capable model to hear an excerpt. The MCP client may
+    transmit the returned audio to its model provider. Longer excerpts should be analysed with listen instead.
+    """
+    import soundfile as sf
+    import soxr
+
+    real = resolve_audio_path(path)
+    with sf.SoundFile(real) as src:
+        duration = len(src) / src.samplerate
+        start = min(float(start_sec), duration)
+        default_duration = 6.0 if channels == "stereo" else 12.0
+        end = min(float(end_sec) if end_sec is not None else start + default_duration, duration)
+        if not start < end:
+            raise ValueError(f"Bad excerpt range: {start:g}-{end:g} s (track length {duration:.1f} s).")
+        max_duration = 6.0 if channels == "stereo" else 15.0
+        if end - start > max_duration:
+            raise ValueError(f"{channels.title()} audio excerpts are limited to {max_duration:g} seconds. "
+                             "Use a shorter range or mono output.")
+        src.seek(round(start * src.samplerate))
+        frames = round((end - start) * src.samplerate)
+        data = src.read(frames, dtype="float32", always_2d=True)
+        source_rate = src.samplerate
+    if channels == "mono":
+        data = data.mean(axis=1)
+    else:
+        if data.shape[1] == 1:
+            data = np.repeat(data, 2, axis=1)
+        elif data.shape[1] > 2:
+            data = data[:, :2]
+    if source_rate != sample_rate:
+        data = soxr.resample(data, source_rate, sample_rate, quality="HQ")
+    buf = io.BytesIO()
+    sf.write(buf, data, sample_rate, format="WAV", subtype="PCM_16")
+    payload = buf.getvalue()
+    report = {
+        "file": os.path.basename(real),
+        "range_sec": {"start": round(start, 3), "end": round(end, 3), "duration": round(end - start, 3)},
+        "format": {"container": "wav", "sample_rate": sample_rate, "channels": channels, "bytes": len(payload)},
+        "privacy": "The MCP client may send this excerpt to its configured model provider.",
+        "fallback": "If audio is not exposed to the model, use listen for a text and spectrogram report.",
+    }
+    return _result(report, audio=(payload, "wav"))
 
 
 @mcp.tool(annotations=ToolAnnotations(title="Listen to the computer (record a game while you play)",
-                                      readOnlyHint=False, destructiveHint=False, openWorldHint=False),
-          structured_output=False)
+                                      readOnlyHint=False, destructiveHint=False, idempotentHint=False,
+                                      openWorldHint=False))
 @friendly
 def capture(
     action: Annotated[Literal["start", "mark", "status", "snapshot", "stop", "devices"], Field(
@@ -588,7 +735,7 @@ def capture(
     max_minutes: Annotated[float, Field(description="For start: stop automatically after this long.", ge=1, le=240)] = 90,
     hotkey: Annotated[str | None, Field(description="For start: global marker hotkey (default ctrl+alt+m).")] = None,
     seconds: Annotated[float, Field(description="For snapshot: how many recent seconds to save (max 60).", ge=3, le=60)] = 30,
-):
+) -> ReportResult:
     """Record what the computer is playing (system audio), e.g. a game while the user plays it.
 
     Typical use: start -> the user plays, pressing the hotkey (Ctrl+Alt+M) when each new level starts, or telling
@@ -597,10 +744,12 @@ def capture(
     with suggested volume changes. Captures everything the output device plays, corrected for the Windows volume
     slider; other apps making sound are reported. Recordings go to <music folder>\\ears captures.
     """
+    if sys.platform != "win32":
+        raise ValueError("System-audio capture is currently available on Windows 10/11 only.")
     from . import capture as cap
 
     if action == "devices":
-        return _dump(cap.list_devices())
+        return _result(cap.list_devices())
     if action == "start":
         rec = cap.start(name, device, max_minutes, hotkey)
         time.sleep(1.2)  # let the hotkey and volume watcher report in
@@ -609,7 +758,7 @@ def capture(
                                "(or tell me). Close other apps that make sound. Ask for status any time; say stop "
                                "when done." if rec.hotkey_ok else
                                "Recording. The marker hotkey isn't available, so tell me when each level starts.")
-        return _dump(st)
+        return _result(st)
     rec = cap.current()
     if rec is None:
         raise ValueError("Nothing has been recorded in this session. Use action='start' first.")
@@ -617,15 +766,15 @@ def capture(
         if not rec.running:
             raise ValueError("The recording has stopped, so there's nothing to mark.")
         m = rec.mark(label)
-        return _dump({"marked": m["label"], "at": cap.mmss(m["t"]), "markers": len(rec.markers)})
+        return _result({"marked": m["label"], "at": cap.mmss(m["t"]), "markers": len(rec.markers)})
     if action == "status":
-        return _dump(rec.status())
+        return _result(rec.status())
     if action == "snapshot":
         if not rec.running:
             raise ValueError("The recording has stopped; use listen on the recording file instead: " + rec.final_path())
         p = rec.snapshot(seconds)
-        return _dump({"saved": p, "seconds": seconds,
-                      "next": "Call listen / describe / notes on this file to hear what is playing right now."})
+        return _result({"saved": p, "seconds": seconds,
+                        "next": "Call listen / describe / notes on this file to hear what is playing right now."})
     # stop
     if rec.running:
         cap.stop()
@@ -633,16 +782,18 @@ def capture(
     if rec.error and not os.path.isfile(path):
         raise ValueError(f"The recording failed: {rec.error}")
     out = _level_output(path)
-    head = json.loads(out[0])
+    head = dict(out.structured_content)
     head = {"recording": path, "length": cap.mmss(rec.elapsed()), "markers": len(rec.markers), **head}
     if rec.error:
         head["recording_error"] = rec.error
-    out[0] = _dump(head)
+    out.structured_content = head
+    out.content[0] = TextContent(type="text", text=_dump(head))
     return out
 
 
-@mcp.tool(annotations=ToolAnnotations(title="Loudness per level (game music balance)", readOnlyHint=True,
-                                      openWorldHint=False), structured_output=False)
+@mcp.tool(annotations=ToolAnnotations(title="Loudness per level (game music balance)",
+                                      readOnlyHint=not save_outputs_enabled(), destructiveHint=False,
+                                      idempotentHint=True, openWorldHint=False))
 @friendly
 def levels(
     path: Annotated[str, Field(description="A capture/recording file, or a folder of music files (one per level).")],
@@ -652,7 +803,7 @@ def levels(
     labels: Annotated[list[str] | None, Field(description="Optional names for the segments, in order.")] = None,
     target_lufs: Annotated[float | None, Field(description="Optional target music level in LUFS; default = match the median level.",
                                                ge=-50, le=-3)] = None,
-):
+) -> ReportResult:
     """Compare loudness between levels: one recording split by markers/silences, or each file in a folder.
 
     Gives each level's music level (median short-term LUFS, robust to short loud effects), integrated LUFS,
@@ -672,23 +823,23 @@ def levels(
             raise ValueError(f"No audio files in {folder}.")
         rep, plot = folder_report([resolve_audio_path(f) for f in files], target_lufs)
         img, fmt, img_path = render.level_bars(plot, output_dir() / f"{os.path.basename(folder)}_levels")
-        rep["image"] = img_path
-        return [_dump(rep), Image(data=img, format=fmt)]
+        if img_path:
+            rep["image_saved"] = img_path
+        return _result(rep, [(img, fmt)])
     return _level_output(resolve_audio_path(p), splits, labels, target_lufs)
 
 
-@mcp.tool(annotations=ToolAnnotations(title="Find audio files", readOnlyHint=True, openWorldHint=False),
-          structured_output=False)
+@mcp.tool(annotations=ToolAnnotations(title="Find audio files", readOnlyHint=True, openWorldHint=False))
 @friendly
 def find_audio(
     query: Annotated[str, Field(description="Part of the file name, e.g. 'my_track'. Empty = any.")] = "",
     folder: Annotated[str | None, Field(description="Optional folder to search (must be inside the music folder).")] = None,
     limit: Annotated[int, Field(description="Max results.", ge=1, le=100)] = 20,
-):
+) -> ReportResult:
     """Find audio files (wav/mp3/flac/aiff/ogg) by name in the music folder, newest first."""
     res = _find_audio(query, folder, limit)
-    res["searched"] = folder or "; ".join(allowed_roots())
-    return _dump(res)
+    res["searched"] = folder or os.pathsep.join(allowed_roots())
+    return _result(res)
 
 
 def main() -> None:

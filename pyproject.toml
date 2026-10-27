@@ -1,0 +1,61 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ears-mcp"
+version = "0.2.0"
+description = "Local audio analysis tools for MCP-compatible AI clients"
+readme = "README.md"
+requires-python = ">=3.12,<3.14"
+license = "MIT"
+authors = [{ name = "ears contributors" }]
+keywords = ["audio", "music", "mcp", "ai"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Multimedia :: Sound/Audio :: Analysis",
+]
+dependencies = [
+  "mcp==2.3.0",
+  "numpy==2.5.4",
+  "scipy==1.18.1",
+  "librosa==1.0.0",
+  "soundfile==0.14.0",
+  "soxr==1.1.0",
+  "pyloudnorm==0.2.0",
+  "matplotlib==3.11.2",
+  "pydantic==2.14.1",
+]
+
+[project.optional-dependencies]
+stems-cpu = [
+  "torch==2.5.1",
+  "torchaudio==2.5.1",
+  "demucs==4.0.1",
+]
+describe-cpu = [
+  "torch==2.5.1",
+  "transformers==4.57.6",
+  "tokenizers==0.22.2",
+  "safetensors==0.8.0",
+  "huggingface-hub==0.36.2",
+]
+capture = [
+  "soundcard==0.4.6; sys_platform == 'win32'",
+  "pycaw==20260927; sys_platform == 'win32'",
+  "comtypes==1.4.17; sys_platform == 'win32'",
+  "psutil==7.2.2; sys_platform == 'win32'",
+]
+
+[project.scripts]
+ears-mcp = "ears.server:main"
+
+[project.urls]
+Homepage = "https://github.com/smcga/ears"
+Repository = "https://github.com/smcga/ears"
+Issues = "https://github.com/smcga/ears/issues"
+
+[tool.setuptools.packages.find]
+include = ["ears*"]

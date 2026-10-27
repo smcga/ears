@@ -1,9 +1,7 @@
-"""Path safety: ears only reads audio files under the allowed root folder(s).
-
-Set EARS_ALLOWED_ROOTS to change it (separate several folders with ';').
-"""
+"""Path safety and local output settings for ears."""
 from __future__ import annotations
 
+import json
 import os
 import time
 from pathlib import Path
@@ -15,11 +13,22 @@ PROJECT_DIR = Path(__file__).resolve().parent.parent
 
 def allowed_roots() -> list[str]:
     raw = os.environ.get("EARS_ALLOWED_ROOTS", DEFAULT_ROOTS)
+    if raw.lstrip().startswith("["):
+        try:
+            values = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError("EARS_ALLOWED_ROOTS is not valid JSON.") from exc
+        if not isinstance(values, list) or not all(isinstance(v, str) for v in values):
+            raise ValueError("EARS_ALLOWED_ROOTS JSON must be an array of folder paths.")
+    else:
+        values = raw.split(os.pathsep)
     roots = []
-    for part in raw.split(";"):
+    for part in values:
         part = part.strip().strip('"')
         if part:
             roots.append(os.path.realpath(part))
+    if not roots:
+        raise ValueError("EARS_ALLOWED_ROOTS must contain at least one folder.")
     return roots
 
 
@@ -110,11 +119,16 @@ def find_audio(query: str = "", folder: str | None = None, limit: int = 20, budg
         except OSError:
             continue
     hits.sort(reverse=True)
-    rows = [
-        f"{time.strftime('%Y-%m-%d %H:%M', time.localtime(m))}  {s / 1e6:6.1f} MB  {p}"
+    files = [
+        {
+            "path": p,
+            "modified_local": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(m)),
+            "modified_unix": round(m, 3),
+            "size_bytes": s,
+        }
         for m, s, p in hits[: max(1, min(limit, 100))]
     ]
-    out = {"matches": len(hits), "newest_first": rows}
+    out = {"matches": len(hits), "files": files}
     if projects_only:
         out["note"] = "Searched project folders only (matches found); pass `folder` to search everywhere."
     elif truncated:
@@ -122,7 +136,30 @@ def find_audio(query: str = "", folder: str | None = None, limit: int = 20, budg
     return out
 
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def save_outputs_enabled() -> bool:
+    """Whether generated images should also be persisted to disk."""
+    return _env_flag("EARS_SAVE_OUTPUTS")
+
+
 def output_dir() -> Path:
     d = Path(os.environ.get("EARS_OUTPUT_DIR", PROJECT_DIR / "output"))
+    if save_outputs_enabled():
+        d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def persistent_cache_dir() -> Path | None:
+    """Return the opt-in persistent embedding cache directory."""
+    raw = os.environ.get("EARS_CACHE_DIR", "").strip()
+    if not raw:
+        return None
+    d = Path(os.path.expanduser(raw)).resolve()
     d.mkdir(parents=True, exist_ok=True)
     return d
