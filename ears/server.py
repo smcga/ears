@@ -43,6 +43,8 @@ INSTRUCTIONS = (
     "capture window or file excerpt to a configured audio-native provider and returns grounded text, measurements, "
     "uncertainty and a memory handle for follow-up questions. Because perception may upload source audio, call it "
     "only when the user asks Ears to hear, identify, critique or compare sound. `auditory_memory` searches prior results. "
+    "Use `timeline` to search the persistent local auditory journal, then `perceive(source='journal:EVENT_ID')` "
+    "to hear the retained sound. `taste` records explicit user music ratings or retrieves personal preference examples. "
     "`capture` records what the computer is playing (e.g. a game while the user plays: start, mark each new level, "
     "status for live levels, snapshot to grab the last seconds, stop for a per-level loudness report); `levels` "
     "compares loudness per level for a recording or per file for a folder of level music. "
@@ -642,6 +644,13 @@ def capabilities() -> ReportResult:
     )
     perception["network"] = "Provider-dependent; Gemini uploads only the selected immutable audio window."
     features = {
+        "auditory_journal": {
+            "available": True, "capture_installed": _module_available("soundcard"),
+            "classifier_installed": _module_available("torch", "transformers"),
+            "whisper_installed": _module_available("faster_whisper"),
+            "daemon": "ears-journal start / stop / status", "startup": "ears-journal install-startup",
+            "network": "Local cached models only; prepare-models downloads weights explicitly.",
+        },
         "listen_compare_levels": {"available": True, "network": False},
         "audio_clip": {"available": True, "network": False, "max_seconds": {"mono": 15, "stereo": 6}},
         "perception": perception,
@@ -737,6 +746,11 @@ def audio_clip(
 def _perception_window(source: str, seconds: float, label: str):
     from .perception import AudioWindow, window_from_file
 
+    if source.startswith("journal:"):
+        from .journal import Journal
+        with Journal() as journal:
+            # Journal IDs resolve only inside the configured clip store, independently of music folder access.
+            return journal.window(source.removeprefix("journal:"), label)
     if source.strip().lower() == "recent":
         if sys.platform != "win32":
             raise ValueError("The recent system-audio source is currently available on Windows 10/11 only. "
@@ -772,7 +786,7 @@ def _perception_window(source: str, seconds: float, label: str):
 @friendly
 def perceive(
     source: Annotated[str, Field(
-        description="'recent' for the current capture buffer, or an absolute path to an allowed audio file.")] = "recent",
+        description="'recent', 'journal:EVENT_ID' from timeline, or an absolute path to an allowed audio file.")] = "recent",
     seconds: Annotated[float, Field(
         description="How much audio to hear, taken from the end of the source (max 60 seconds).", ge=3, le=60)] = 30,
     question: Annotated[str, Field(
@@ -805,12 +819,71 @@ def perceive(
             if seconds > 30:
                 raise ValueError("A/B perception is limited to 30 seconds per source to bound upload size and cost.")
             windows += (_perception_window(against, seconds, "B"),)
+    if not memory_id and source.startswith("journal:"):
+        from .journal import Journal
+        with Journal() as journal:
+            report_taste = journal.taste(source.removeprefix("journal:"))
+        if report_taste.get("neighbours"):
+            question += "\nUser preference examples (personal taste, not quality): " + _dump(report_taste)
     report = perceive_windows(windows, question, provider, memory_id)
+    report["sources"] = [{"source": w.source, "label": w.label,
+                           "origin_start_sec": w.origin_start_sec, "origin_end_sec": w.origin_end_sec} for w in windows]
     report["privacy"] = (
         "The selected audio is sent to the configured perception provider unless the local silence guard handles it. "
         "No recording file is created for a recent-audio question."
     )
     return _result(report)
+
+
+@mcp.tool(annotations=ToolAnnotations(title="Search the auditory journal", readOnlyHint=True,
+                                      destructiveHint=False, idempotentHint=True, openWorldHint=False))
+@friendly
+def timeline(
+    since: Annotated[str | None, Field(description="ISO time with timezone, Unix seconds, or '1h ago'. Default last hour.")] = None,
+    until: Annotated[str | None, Field(description="ISO time with timezone or Unix seconds. Default now.")] = None,
+    query: Annotated[str, Field(description="Search literal text, transcript, tags and active apps.", max_length=500)] = "",
+    limit: Annotated[int, Field(description="Max events, newest first.", ge=1, le=200)] = 50,
+) -> ReportResult:
+    """Search local persistent audio history. Use perceive with journal:EVENT_ID to hear an exact retained clip.
+
+    The independent journal daemon must be running to create new entries. Classifier/transcript results are local
+    model estimates. active_apps lists apps active in the mixed output, not certain attribution of a sound.
+    """
+    from .journal import Journal, JournalConfig
+    from .journal_daemon import daemon_status
+    config = JournalConfig.from_env()
+    events = []
+    if (config.root / "journal.sqlite3").is_file():
+        with Journal(config) as journal:
+            events = journal.search(since, until, query, limit)
+    state = daemon_status(config)
+    return _result({"events": events, "daemon": state, "query": query,
+                    "retention_hours": state.get("retention_hours", config.hours),
+                    "clip_budget_bytes": state.get("clip_budget_bytes", config.max_bytes),
+                    "app_attribution": "Apps active in the output mix; individual sound sources are uncertain."})
+
+
+@mcp.tool(annotations=ToolAnnotations(title="Calibrate personal music taste", readOnlyHint=False,
+                                      destructiveHint=False, idempotentHint=True, openWorldHint=False))
+@friendly
+def taste(
+    event_id: Annotated[str | None, Field(description="Journal music event to rate or compare to prior ratings.")] = None,
+    rating: Annotated[float | None, Field(description="Explicit user rating: 1 dislike to 5 love. Omit to read preferences.",
+                                          ge=1, le=5)] = None,
+    note: Annotated[str, Field(description="The user's reasons or preferences.", max_length=2000)] = "",
+) -> ReportResult:
+    """Store an explicit user rating or retrieve personal CLAP neighbours and their measured evidence.
+
+    Never invent a rating on the user's behalf. Predictions require at least three similar examples and describe
+    personal preference, not objective musical quality. Ratings survive audio retention and can be updated by event ID.
+    """
+    from .journal import Journal
+    with Journal() as journal:
+        if rating is not None:
+            if not event_id:
+                raise ValueError("event_id is required when recording a rating.")
+            return _result(journal.rate(event_id, rating, note))
+        return _result(journal.taste(event_id))
 
 
 @mcp.tool(annotations=ToolAnnotations(title="Search auditory memory", readOnlyHint=True,

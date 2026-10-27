@@ -386,7 +386,7 @@ async def run_mcp_test():
             tools = sorted(t.name for t in listed)
             check(tools == ["audio_clip", "auditory_memory", "capabilities", "capture", "compare", "describe",
                             "expect", "find_audio", "levels", "listen", "listen_live", "notes", "perceive",
-                            "sounds_like", "stems"],
+                            "sounds_like", "stems", "taste", "timeline"],
                   f"tools listed: {tools}")
             check(all(t.output_schema for t in listed), "every tool advertises structured output")
             t0 = time.time()
