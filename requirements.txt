@@ -1,0 +1,11 @@
+# ears core (listen / compare / find_audio). Python 3.12.
+# Full transitive pins: requirements.lock.txt
+mcp==2.3.0
+numpy==2.5.4
+scipy==1.18.1
+librosa==1.0.0
+soundfile==0.14.0
+soxr==1.1.0
+pyloudnorm==0.2.0
+matplotlib==3.11.2
+pydantic==2.14.1

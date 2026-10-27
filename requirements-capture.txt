@@ -1,0 +1,5 @@
+# Optional: the `capture` tool (record what Windows is playing, e.g. a game). Windows only.
+soundcard==0.4.6
+pycaw==20260927
+comtypes==1.4.17
+psutil==7.2.2

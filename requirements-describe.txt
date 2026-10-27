@@ -1,0 +1,10 @@
+# Optional: the `describe` tool (LAION CLAP tags). Needs PyTorch from requirements-stems.txt.
+# transformers 5.x needs PyTorch >= 2.6; we stay on 4.x so Demucs keeps its tested PyTorch 2.5.1.
+# Models (downloaded on first use, ~1.3 GB, pinned to Hugging Face's own safetensors conversions):
+#   laion/larger_clap_music_and_speech @ 8a2acdbf328883b3cc38b575179e5950cf2deeb4
+#   laion/clap-htsat-unfused           @ 79b58ed25fc00386262a2bea4b19fd21dc4310a0
+# (laion/larger_clap_music loads but gives meaningless text embeddings with this transformers version.)
+transformers==4.57.6
+tokenizers==0.22.2
+safetensors==0.8.0
+huggingface-hub==0.36.2

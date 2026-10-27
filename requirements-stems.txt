@@ -1,0 +1,6 @@
+# Optional: the `stems` tool (Demucs). CUDA 12.4 build of PyTorch for NVIDIA GPUs.
+# For CPU-only, drop the +cu124 suffixes and the extra index line (separation will be ~10x slower).
+--extra-index-url https://download.pytorch.org/whl/cu124
+torch==2.5.1+cu124
+torchaudio==2.5.1+cu124
+demucs==4.0.1
