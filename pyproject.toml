@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ears-mcp"
-version = "0.3.0"
+version = "0.4.0"
 description = "Audio analysis and provider-neutral auditory perception for MCP clients"
 readme = "README.md"
 requires-python = ">=3.12,<3.14"
@@ -30,6 +30,14 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+journal = [
+  "soundcard==0.4.6",
+  "torch>=2.5,<3",
+  "transformers==4.57.6",
+  "faster-whisper>=1.2,<2",
+  "pycaw==20260927; sys_platform == 'win32'",
+  "comtypes==1.4.17; sys_platform == 'win32'",
+]
 stems-cpu = [
   "torch==2.5.1",
   "torchaudio==2.5.1",
@@ -51,6 +59,7 @@ capture = [
 
 [project.scripts]
 ears-mcp = "ears.server:main"
+ears-journal = "ears.journal_daemon:main"
 
 [project.urls]
 Homepage = "https://github.com/smcga/ears"

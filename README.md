@@ -6,6 +6,10 @@ Ears turns audio into measurements, musical structure, learned descriptions and 
 
 Every perception result separates what the model heard, what Ears measured from the original waveform, and what the model recommends. Perceptual and aesthetic claims can still be wrong; measurements provide evidence rather than a universal score for whether music is good.
 
+The optional **auditory journal** listens independently of your chat: it records local event labels, speech transcripts,
+music embeddings and short FLAC clips in a persistent SQLite timeline. Search what happened later, then ask your
+chosen perception model to hear the exact retained clip. Background processing uses local models, with no Gemini calls.
+
 ## Compatibility
 
 | Capability | Requirement |
@@ -15,7 +19,8 @@ Every perception result separates what the model heard, what Ears measured from 
 | Short source-audio excerpts | Client/model support for MCP `AudioContent`; only sent when `audio_clip` is called |
 | Open-ended audio perception | Any text-capable MCP client; a configured audio-native provider such as Gemini |
 | Core file analysis | Windows, macOS or Linux; Python 3.12 or 3.13 |
-| System-audio capture | Windows 10/11 only |
+| Journal capture | Windows WASAPI; Linux PulseAudio/PipeWire monitor; macOS with a routed virtual loopback input |
+| Game-session `capture` tool | Windows 10/11 only |
 | FL Studio bar/note conventions | Optional workflow convention, not a protocol requirement |
 
 ## Tools
@@ -33,6 +38,8 @@ Every perception result separates what the model heard, what Ears measured from 
 | `audio_clip(path, start_sec?, end_sec?)` | Returns an explicitly requested excerpt of at most 15 seconds as standard MCP audio, with a text fallback and privacy warning | <1 s |
 | `perceive(source, seconds?, question?, provider?, against?, memory_id?)` | Asks an audio-native model what is actually audible in a recent capture or file. Returns timestamped events, uncertainty, original-waveform measurements and recommendations as text/JSON. Supports A/B comparison and exact-audio follow-ups | provider-dependent |
 | `auditory_memory(query?, limit?)` | Searches the bounded, in-process event index created by prior `perceive` calls; returned handles can be listened to again | <1 s |
+| `timeline(since?, until?, query?, limit?)` | Searches the persistent journal by time, transcript, labels and active apps. Returns `journal:EVENT_ID` references for listening again | <1 s normally |
+| `taste(event_id?, rating?, note?)` | Records your explicit 1–5 music ratings, or finds similar rated CLAP examples and their waveform measurements | <1 s normally |
 | `capabilities()` | Reports installed optional features, platform support, allowed folders and persistence settings | <1 s |
 | `capture(action, ...)` | Records what Windows is playing (Windows only). `start`, then press **Ctrl+Alt+M** as each new level starts; `status` = live readout; `snapshot` = optionally save recent audio; `stop` = per-level loudness report + timeline. `perceive(source="recent")` reads the buffer without saving | live; report in a few s |
 | `levels(path, splits?, labels?, target_lufs?)` | Loudness per level: a capture split by its markers (or by silences, or your times), or a **folder** of music files (one per level). Gives each level's music level, the dB change and linear volume (e.g. for a Unity AudioSource) to match the others or a target | ~1 s per minute of audio |
@@ -83,7 +90,123 @@ Then use `capture(action="start")`, play the sound, and call `perceive(source="r
 
 The provider boundary is deliberately small. Local or alternative cloud integrations can implement the `PerceptionBackend` protocol and call `register_backend(name, factory)` in `ears.perception`; the MCP tool and result schema do not depend on Gemini. A Qwen or other local adapter can therefore be added without changing clients.
 
-Perception is on demand, not uninterrupted cloud streaming. Prior calls form a bounded event index searchable with `auditory_memory`, but an ordinary MCP server cannot proactively insert commentary into an arbitrary chat; the client still decides when tools run.
+Perception is on demand. Prior calls form a bounded event index searchable with `auditory_memory`; continuous local
+history comes from the separate journal below. The MCP client decides when to ask questions or show commentary.
+
+## Always-on auditory journal
+
+Install the optional models and capture dependencies in the same environment as the server:
+
+```powershell
+.venv\Scripts\python.exe -m pip install -e ".[journal]"
+.venv\Scripts\ears-journal.exe prepare-models
+.venv\Scripts\ears-journal.exe start
+.venv\Scripts\ears-journal.exe status
+```
+
+On macOS/Linux, use `.venv/bin/python` and `.venv/bin/ears-journal`. `prepare-models` explicitly downloads the
+configured weights once. The listener loads cached weights only: missing packages or models appear in each event's
+`errors` and in daemon status, while the raw clip is retained. This degraded mode does not invent semantic labels.
+
+The listener has no session duration cap. It checks activity every two seconds, groups active audio into clips of up
+to twelve seconds, and stores silence as metadata without a clip. Inference runs behind a bounded capture queue.
+If inference cannot keep up, dropped-block counts and timeline gaps expose the missing history. CPU speed depends on
+the hardware and selected models; this is not a claim that every laptop can run every model in real time.
+
+Background inference uses an [AudioSet AST classifier](https://huggingface.co/MIT/ast-finetuned-audioset-10-10-0.4593)
+for speech/music/effects/notification candidates, [tiny Whisper through faster-whisper](https://github.com/SYSTRAN/faster-whisper)
+on CPU with int8 computation for speech, and the first pinned CLAP music model for music vectors. Labels, transcripts
+and source estimates can be wrong. The journal stores their provenance and errors with the waveform evidence.
+
+### Start at login and stop
+
+```powershell
+.venv\Scripts\ears-journal.exe install-startup
+.venv\Scripts\ears-journal.exe stop
+.venv\Scripts\ears-journal.exe remove-startup
+```
+
+`install-startup` creates a hidden Windows login launcher, a Linux systemd user unit, or a macOS LaunchAgent. It takes
+effect at the next login; `start` starts the current session. `stop` requests a clean flush and shutdown;
+`remove-startup` removes the login integration without deleting history. Installation does not require an administrator.
+Keep the installed environment at its original path. `run` runs in the foreground for troubleshooting.
+
+Startup saves the journal/local-model settings to `service-config.json` inside the journal directory. Cloud API keys
+are excluded. Re-run `install-startup` after changing journal settings. Point your MCP client at the same
+`EARS_JOURNAL_DIR` as the daemon; the default is `%LOCALAPPDATA%/ears/journal` on Windows and
+`~/.local/state/ears/journal` elsewhere.
+
+### Cross-platform audio routing
+
+- Windows uses WASAPI output loopback. The journal keeps raw audio and does not create game-session recordings.
+- Linux uses a PulseAudio monitor, including PipeWire's PulseAudio compatibility server. Install the system's
+  PulseAudio client libraries and `pactl` for active-app attribution. No microphone is selected by default.
+- macOS needs a virtual input such as BlackHole and routing of system audio into it. Set `EARS_JOURNAL_DEVICE` to
+  that input's name; Ears refuses to silently substitute the default microphone. Active-app attribution is unavailable.
+
+Use `ears-journal devices` to list output devices and monitor/virtual inputs. Without a pinned device, Windows/Linux
+follow default output changes and reconnect after failures. Connection errors remain visible through `timeline` and
+`ears-journal status`. `active_apps` means apps active in the mixed output, not proof that a particular app produced
+a particular sound.
+
+### Search, listen again, and learn your taste
+
+```python
+timeline(since="1h ago", query="shout")
+perceive(source="journal:EVENT_ID", question="What was that noise?", provider="gemini")
+perceive(source="journal:EVENT_ID", question="Does the music work?", provider="qwen")
+taste(event_id="EVENT_ID", rating=5, note="Love the swung drums and restrained bass")
+taste(event_id="ANOTHER_EVENT_ID")
+```
+
+Times accept ISO timestamps with a timezone, Unix seconds, or relative forms such as `1h ago` and `2d ago`.
+Search is a case-insensitive literal substring over transcripts, tags, apps and event details. Returned clips preserve
+their original timestamps and can be perceived by any text-capable MCP client. A missing/expired clip produces an
+explicit error. Unlike the `seconds` selection for files, a journal reference retrieves its entire bounded event clip.
+
+Taste calibration saves explicit user ratings with their CLAP vector and measured evidence. It finds neighbours only
+within the same model/revision, excludes the target's own rating, and estimates preference only after three similar
+rated examples. Similar examples, user notes and measurements accompany the estimate; this is personal taste rather
+than a track-quality score. `perceive` automatically includes available preference examples for journal clips.
+Ratings survive clip expiration, are editable, and are capped at the latest 5,000 examples.
+
+### Local Qwen perception
+
+Run a compatible local [Qwen3-Omni vLLM server](https://github.com/QwenLM/Qwen3-Omni#vllm-serve-usage), then set:
+
+```text
+EARS_QWEN_URL=http://127.0.0.1:8901/v1
+EARS_QWEN_MODEL=Qwen/Qwen3-Omni-30B-A3B-Instruct
+```
+
+Use `provider="qwen"` for on-demand perception. Set `EARS_JOURNAL_CAPTIONS=1` to add richer local captions to each
+active journal segment. This option needs substantial inference hardware and can increase processing backlog.
+The adapter uses loopback HTTP with proxies and redirects disabled; it does not send source audio to an external
+provider. Hosting the Qwen model is a separate setup step and is not included in the lightweight journal install.
+
+### Retention and budgets
+
+The defaults retain at most 24 hours, 512 MiB of clips, and 20,000 event rows, evicting oldest events first.
+Whichever limit is reached first wins, so loud/compressed content may retain less than a day. Retention runs during
+recording and idle periods. SQLite pages are reused; model caches, ratings and small metadata files are separate from
+the clip budget. A clip being written can temporarily exceed the budget by one bounded segment. Crash recovery
+removes unreferenced clips. Audio cannot be recovered after retention removes it.
+
+| Setting | Default / purpose |
+|---|---|
+| `EARS_JOURNAL_DIR` | Persistent journal and clips directory; use the same path in the daemon and MCP client |
+| `EARS_JOURNAL_HOURS` | `24`, rolling retention in hours |
+| `EARS_JOURNAL_MAX_MB` | `512`, clip budget in MiB |
+| `EARS_JOURNAL_MAX_EVENTS` | `20000`, maximum event metadata rows |
+| `EARS_JOURNAL_SEGMENT_SECONDS` | `12`, maximum grouped active clip length (up to 30, multiples of 2) |
+| `EARS_JOURNAL_DEVICE` | Optional fixed output / required macOS virtual input |
+| `EARS_JOURNAL_CLASSIFIER` | `1`; set `0` to disable AudioSet classification |
+| `EARS_JOURNAL_WHISPER` | `1`; set `0` to disable transcription |
+| `EARS_JOURNAL_CLAP` | `1`; set `0` to disable music vectors |
+| `EARS_JOURNAL_WHISPER_MODEL` | `tiny`; model name or local faster-whisper directory |
+| `EARS_JOURNAL_CLASSIFIER_MODEL` | `MIT/ast-finetuned-audioset-10-10-0.4593` or a local model directory |
+| `EARS_JOURNAL_CPU_THREADS` | `2`, limits CPU inference threads |
+| `EARS_JOURNAL_CAPTIONS` | `0`, opt-in local Qwen captions |
 
 ### Game captures, what to know
 
@@ -171,6 +294,8 @@ Clients that do not forward images or audio to their model still receive the com
 ## Privacy and side effects
 
 - Core analysis is local and does not upload source audio.
+- The journal persists system audio, transcripts and active-app names locally until its retention limits apply.
+  Starting it is explicit; login startup is installed only by `install-startup`. It does not call Gemini in the background.
 - `perceive` sends only the selected immutable audio window to its configured provider. Gemini calls use its API directly and return text/JSON to any MCP client. Effectively silent windows are handled locally and are not uploaded.
 - Perception memory is bounded, process-local and never written to disk. It disappears when Ears restarts.
 - `describe`, `expect`, `listen_live` and `sounds_like` may download pinned CLAP weights from Hugging Face on first use.
@@ -185,13 +310,16 @@ Clients that do not forward images or audio to their model still receive the com
 .venv\Scripts\python.exe tests\selftest.py
 .venv\Scripts\python.exe tests\contract_test.py
 .venv\Scripts\python.exe tests\perception_test.py
+.venv\Scripts\python.exe tests\journal_test.py
 ```
 
 The synthetic-audio suite checks tempo, key, sections, clipping, MP3/FLAC decoding, comparison, path safety and game-level loudness. Perception tests cover silence, A/B input, provider failure, exact-audio follow-ups, event memory and separation of raw listening audio from corrected measurements. Optional model-backed checks run when their packages are installed. The contract test starts the real stdio server and verifies structured results and media contracts.
 
 The device/provider acceptance checklist in [tests/perception_acceptance.md](tests/perception_acceptance.md) covers real music, mixed dialogue/effects, A/B judgement, text-only clients and failure/disconnection behaviour.
 
-GitHub Actions runs the core suite on Windows and Linux with Python 3.12 and 3.13.
+GitHub Actions runs the core suite on Windows, Linux and macOS with Python 3.12 and 3.13. Journal tests exercise
+SQLite persistence, literal/time search, retention and budget eviction, immutable clip retrieval, singleton locking,
+segmentation, shutdown, taste neighbours, and the local-model HTTP contract without recording live system audio.
 
 ## Licence
 

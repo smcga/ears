@@ -105,6 +105,11 @@ def provider_status() -> dict[str, Any]:
     return {
         "default": default,
         "providers": {
+            "qwen": {
+                "configured": bool(os.environ.get("EARS_QWEN_URL")),
+                "model": os.environ.get("EARS_QWEN_MODEL", "Qwen/Qwen3-Omni-30B-A3B-Instruct"),
+                "network": "Loopback HTTP only", "audio_leaves_computer": False,
+            },
             "gemini": {
                 "configured": bool(_api_key()),
                 "model": os.environ.get("EARS_GEMINI_MODEL", DEFAULT_GEMINI_MODEL),
@@ -112,7 +117,7 @@ def provider_status() -> dict[str, Any]:
                 "audio_leaves_computer": True,
             },
             **{name: {"configured": True, "model": "backend-defined"}
-               for name in _backends if name != "gemini"},
+               for name in _backends if name not in {"gemini", "qwen"}},
         },
     }
 
@@ -307,6 +312,14 @@ class GeminiBackend:
 
 
 register_backend("gemini", GeminiBackend)
+
+
+def _qwen_backend():
+    from .local_perception import QwenBackend
+    return QwenBackend()
+
+
+register_backend("qwen", _qwen_backend)
 
 
 def remember(windows: tuple[AudioWindow, ...]) -> tuple[str, MemoryItem]:

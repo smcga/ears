@@ -5,6 +5,7 @@ import asyncio
 import os
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 import numpy as np
@@ -23,15 +24,21 @@ async def main() -> None:
         t = np.arange(sr * 3) / sr
         sf.write(path, 0.1 * np.sin(2 * np.pi * 440 * t), sr)
         sf.write(silence_path, np.zeros(sr * 3, dtype=np.float32), sr)
+        from ears.journal import Journal, JournalConfig
+        journal_root = folder / "journal"
+        with Journal(JournalConfig(journal_root)) as journal:
+            event_id = journal.add(time.time() - 10, time.time() - 7,
+                                   {"text": "quiet fixture", "kind": "silence"},
+                                   np.zeros((sr * 3, 2), dtype=np.float32), sr)
         params = StdioServerParameters(
             command=sys.executable,
             args=[str(ROOT / "ears_server.py")],
-            env={**os.environ, "EARS_ALLOWED_ROOTS": str(folder)},
+            env={**os.environ, "EARS_ALLOWED_ROOTS": str(folder), "EARS_JOURNAL_DIR": str(journal_root)},
         )
         async with Client(params, mode="legacy", read_timeout_seconds=20) as client:
             tools = (await client.list_tools()).tools
             names = {tool.name for tool in tools}
-            assert {"listen", "audio_clip", "capabilities", "find_audio", "perceive", "auditory_memory"} <= names
+            assert {"listen", "audio_clip", "capabilities", "find_audio", "perceive", "auditory_memory", "taste", "timeline"} <= names
             assert all(tool.output_schema for tool in tools)
             by_name = {tool.name: tool for tool in tools}
             assert by_name["listen"].annotations.read_only_hint is True
@@ -61,6 +68,15 @@ async def main() -> None:
             assert not result.is_error
             assert result.structured_content["heard"]["summary"] == "Effectively silent audio."
             assert result.structured_content["provenance"]["audio_uploaded"] is False
+
+            result = await client.call_tool("timeline", {"since": "1h ago", "query": "quiet fixture"})
+            assert not result.is_error
+            assert result.structured_content["events"][0]["event_id"] == event_id
+            result = await client.call_tool("perceive", {"source": "journal:" + event_id,
+                                                       "question": "What was audible?"})
+            assert not result.is_error
+            assert result.structured_content["provenance"]["audio_uploaded"] is False
+            assert result.structured_content["sources"][0]["source"] == "journal:" + event_id
 
     print("MCP contract: ok")
 

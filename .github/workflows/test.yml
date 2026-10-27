@@ -12,7 +12,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-latest, windows-latest, macos-latest]
         python: ["3.12", "3.13"]
     runs-on: ${{ matrix.os }}
     steps:
@@ -29,3 +29,4 @@ jobs:
           EARS_SKIP_MCP_TEST: "1"
       - run: python tests/contract_test.py
       - run: python tests/perception_test.py
+      - run: python tests/journal_test.py
