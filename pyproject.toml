@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ears-mcp"
-version = "0.2.0"
-description = "Local audio analysis tools for MCP-compatible AI clients"
+version = "0.3.0"
+description = "Audio analysis and provider-neutral auditory perception for MCP clients"
 readme = "README.md"
 requires-python = ">=3.12,<3.14"
 license = "MIT"

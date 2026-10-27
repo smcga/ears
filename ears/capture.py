@@ -1,7 +1,7 @@
 """Record what the computer is playing (WASAPI loopback), e.g. a game while you play it.
 
-- Captures the output device's mix, corrected for the Windows volume slider so levels are what the game
-  actually sends (the slider is applied before the loopback point on software-volume devices).
+- Keeps the output device's raw loopback mix for listening and recording. A separate volume-corrected
+  signal feeds loudness measurements, so correction cannot distort what a perception model hears.
 - Global hotkey (default Ctrl+Alt+M) drops a marker without leaving the game.
 - Writes a WAV while recording (header refreshed every few seconds, so a crash still leaves a usable file),
   then converts it to FLAC on stop. Markers and notes go in <name>.markers.json next to it.
@@ -148,6 +148,7 @@ class Recorder:
             i += 1
         self.base = base
         self.wav_path, self.flac_path = base + ".wav", base + ".flac"
+        self.measure_wav_path = base + ".measurement.tmp.wav"
         self.max_frames = int(max_minutes * 60 * SR)
         self.hotkey = hotkey
         self.hotkey_ok: bool | None = None
@@ -212,34 +213,42 @@ class Recorder:
 
     # -- threads --
     def _record(self) -> None:
-        wav = None
+        wav = measure_wav = None
         try:
             sc = _sc()
             mic = sc.get_microphone(id=self.speaker.id, include_loopback=True)
             wav = sf.SoundFile(self.wav_path, "w", samplerate=SR, channels=2, subtype="PCM_24", format="WAV")
+            measure_wav = sf.SoundFile(
+                self.measure_wav_path, "w", samplerate=SR, channels=2, subtype="FLOAT", format="WAV"
+            )
             last_sync = time.time()
             with mic.recorder(samplerate=SR, channels=2) as rec:
                 self._ready.set()
                 while not self._stop.is_set():
-                    x = rec.record(numframes=BLOCK)
-                    if x.ndim == 1:
-                        x = np.repeat(x[:, None], 2, axis=1)
-                    elif x.shape[1] == 1:
-                        x = np.repeat(x, 2, axis=1)
-                    if self.gain_db:
-                        x = x * np.float32(10 ** (self.gain_db / 20))
-                    if np.abs(x).max() > 1.0:
+                    raw = rec.record(numframes=BLOCK)
+                    if raw.ndim == 1:
+                        raw = np.repeat(raw[:, None], 2, axis=1)
+                    elif raw.shape[1] == 1:
+                        raw = np.repeat(raw, 2, axis=1)
+                    # Own the block: some recorder implementations reuse their input buffer on the next read.
+                    raw = np.array(raw, dtype=np.float32, order="C", copy=True)
+                    measured = self.measurement_audio(raw, self.gain_db)
+                    if np.abs(measured).max() > 1.0:
                         self.clipped_blocks += 1
-                    wav.write(np.clip(x, -1, 1))
-                    self.lt.push(x)
+                    # Preserve the loopback waveform for recording and perception. libsndfile performs
+                    # the unavoidable PCM conversion; volume correction is measurement-only.
+                    wav.write(raw)
+                    measure_wav.write(measured)
+                    self.lt.push(measured)
                     with self._lock:
-                        self.frames += len(x)
-                        self.ring.append(x)
-                        self.ring_frames += len(x)
+                        self.frames += len(raw)
+                        self.ring.append(raw)
+                        self.ring_frames += len(raw)
                         while self.ring_frames - len(self.ring[0]) >= RING_SEC * SR:
                             self.ring_frames -= len(self.ring.popleft())
                     if time.time() - last_sync > 5:
                         _update_header(wav)
+                        _update_header(measure_wav)
                         last_sync = time.time()
                     if self.frames >= self.max_frames:
                         self.stopped_reason = self.stopped_reason or "reached the time limit"
@@ -250,6 +259,8 @@ class Recorder:
         finally:
             if wav is not None:
                 wav.close()
+            if measure_wav is not None:
+                measure_wav.close()
             self._stop.set()
             self._quit_hotkey()
             self._done.set()
@@ -325,6 +336,13 @@ class Recorder:
             user32.UnregisterHotKey(None, 1)
 
     # -- outputs --
+    @staticmethod
+    def measurement_audio(raw: np.ndarray, gain_db: float) -> np.ndarray:
+        """Return a corrected measurement signal without mutating the raw listening signal."""
+        if not gain_db:
+            return raw
+        return raw * np.float32(10 ** (gain_db / 20))
+
     def _notes(self) -> dict:
         out: dict = {}
         others = [f"{a} ({n} s)" for a, n in self.apps.most_common() if a.lower() not in _IGNORE_APPS]
@@ -340,13 +358,17 @@ class Recorder:
                                   "second, so the moment of each change may be off.")
         if self.clipped_blocks:
             out["clipped_blocks"] = self.clipped_blocks
+            out["clipping_note"] = "Clipping was detected in the volume-corrected measurement signal."
         return out
 
     def _write_sidecar(self, final: bool = False) -> None:
         data = {"device": self.speaker.name, "started": datetime.fromtimestamp(self.started_at).isoformat(timespec="seconds"),
                 "seconds": round(self.elapsed(), 1), "markers": list(self.markers),
                 "windows_volume_db": self.volume_hist[-1] if self.volume_hist else None,
-                "volume_corrected": not self.hw_volume, "final": final}
+                "recording_signal": "raw loopback audio",
+                "measurement_signal": "volume-corrected" if not self.hw_volume else "raw (hardware volume)",
+                "volume_corrected": False,
+                "measurement_volume_corrected": not self.hw_volume, "final": final}
         data.update(self._notes())
         target = self.flac_path if final else self.wav_path
         try:
@@ -377,16 +399,46 @@ class Recorder:
     def final_path(self) -> str:
         return self.flac_path if os.path.isfile(self.flac_path) else self.wav_path
 
-    def snapshot(self, seconds: float) -> str:
+    def measurement_path(self) -> str:
+        """Temporary volume-corrected signal used only for reproducible capture measurements."""
+        return self.measure_wav_path if os.path.isfile(self.measure_wav_path) else self.final_path()
+
+    def cleanup_measurement(self) -> None:
+        try:
+            if os.path.isfile(self.measure_wav_path):
+                os.remove(self.measure_wav_path)
+        except OSError as exc:
+            print(f"ears: couldn't remove temporary measurement audio: {exc}", file=sys.stderr)
+
+    def recent_audio(self, seconds: float) -> tuple[np.ndarray, int, dict]:
+        """Return an immutable copy of recent raw audio without touching disk."""
+        seconds = min(max(float(seconds), 0.0), RING_SEC)
         with self._lock:
             blocks = list(self.ring)
             now = self.elapsed()
         if not blocks:
-            raise ValueError("Nothing recorded yet.")
-        x = np.concatenate(blocks)[-int(min(seconds, RING_SEC) * SR):]
+            detail = f" The capture stopped because: {self.error}" if self.error else ""
+            raise ValueError("Nothing has been captured yet." + detail)
+        x = np.concatenate(blocks)[-int(seconds * SR):].copy()
+        x.setflags(write=False)
+        start = max(0.0, now - len(x) / SR)
+        meta = {
+            "device": self.speaker.name,
+            "session_start_sec": round(start, 3),
+            "session_end_sec": round(now, 3),
+            "running": self.running,
+            "error": self.error,
+            "muted_during_session": bool(self.muted_sec),
+            "signal": "raw loopback audio; Windows-volume correction is measurement-only",
+        }
+        return x, SR, meta
+
+    def snapshot(self, seconds: float) -> str:
+        x, sr, meta = self.recent_audio(seconds)
+        now = meta["session_end_sec"]
         stamp = f"{int(now // 60):02d}-{int(now % 60):02d}"
         out = f"{self.base}_snap_{stamp}.flac"
-        sf.write(out, np.clip(x, -1, 1), SR, subtype="PCM_24", format="FLAC")
+        sf.write(out, x, sr, subtype="PCM_24", format="FLAC")
         return out
 
     def status(self) -> dict:
@@ -394,7 +446,9 @@ class Recorder:
         n = len(ms)
         el = self.elapsed()
         st = {"recording": self.running, "file": self.final_path() if not self.running else self.wav_path,
-              "elapsed": mmss(el), "device": self.speaker.name}
+              "elapsed": mmss(el), "device": self.speaker.name,
+              "recording_signal": "raw loopback audio",
+              "levels_signal": "volume-corrected measurement" if not self.hw_volume else "raw measurement"}
         if self.error:
             st["error"] = self.error
         if n >= 30:
@@ -460,7 +514,11 @@ def start(name: str, device: str | None, max_minutes: float, hotkey: str | None)
             raise ValueError(f"Already recording to {_current.wav_path} ({mmss(_current.elapsed())} so far). "
                              "Stop it first.")
         rec = Recorder(name, device, max_minutes, hotkey or os.environ.get("EARS_MARK_HOTKEY", DEFAULT_HOTKEY))
-        rec.start()
+        try:
+            rec.start()
+        except Exception:
+            rec.cleanup_measurement()
+            raise
         _current = rec
         return rec
 
@@ -477,5 +535,7 @@ def stop() -> Recorder:
 @atexit.register
 def _shutdown() -> None:
     rec = _current
-    if rec is not None and rec.running:
-        rec.stop("ears was shut down")
+    if rec is not None:
+        if rec.running:
+            rec.stop("ears was shut down")
+        rec.cleanup_measurement()

@@ -1,10 +1,10 @@
 # ears
 
-Local audio analysis for any AI client that supports local [Model Context Protocol](https://modelcontextprotocol.io/) tools over stdio.
+Audio analysis and open-ended auditory perception for any AI client that supports local [Model Context Protocol](https://modelcontextprotocol.io/) tools over stdio.
 
-Ears turns audio files into measurements, musical structure, learned descriptions and visualisations that a language model can reason about. Every tool returns a text report plus structured MCP data. Image-capable clients also receive spectrograms; audio-capable clients can receive an explicitly requested short excerpt.
+Ears turns audio into measurements, musical structure, learned descriptions and visualisations that a language model can reason about. Its optional perception layer can also send an immutable audio window directly to a configured audio-native model and return the interpretation as text, so the chat client itself does not need audio support.
 
-Ears is a sensory layer, not an LLM. Most tools measure or classify audio locally; they do not reproduce human hearing or decide whether music is good.
+Every perception result separates what the model heard, what Ears measured from the original waveform, and what the model recommends. Perceptual and aesthetic claims can still be wrong; measurements provide evidence rather than a universal score for whether music is good.
 
 ## Compatibility
 
@@ -13,6 +13,7 @@ Ears is a sensory layer, not an LLM. Most tools measure or classify audio locall
 | Text and structured reports | Any local stdio MCP client |
 | Spectrograms and piano rolls | Client/model support for MCP `ImageContent`; text remains available without it |
 | Short source-audio excerpts | Client/model support for MCP `AudioContent`; only sent when `audio_clip` is called |
+| Open-ended audio perception | Any text-capable MCP client; a configured audio-native provider such as Gemini |
 | Core file analysis | Windows, macOS or Linux; Python 3.12 or 3.13 |
 | System-audio capture | Windows 10/11 only |
 | FL Studio bar/note conventions | Optional workflow convention, not a protocol requirement |
@@ -30,8 +31,10 @@ Ears is a sensory layer, not an LLM. Most tools measure or classify audio locall
 | `listen_live(path, bpm?, session_id?, bars?, my_guess?)` | Step through a track a few bars at a time without seeing ahead. The first call returns an explicit session handle for later calls | a few s per step |
 | `sounds_like(path, against? or folder?)` | Describes each section by the closest-sounding section in your other tracks (learned CLAP fingerprints) instead of adjectives | ~15 s per new reference, then cached |
 | `audio_clip(path, start_sec?, end_sec?)` | Returns an explicitly requested excerpt of at most 15 seconds as standard MCP audio, with a text fallback and privacy warning | <1 s |
+| `perceive(source, seconds?, question?, provider?, against?, memory_id?)` | Asks an audio-native model what is actually audible in a recent capture or file. Returns timestamped events, uncertainty, original-waveform measurements and recommendations as text/JSON. Supports A/B comparison and exact-audio follow-ups | provider-dependent |
+| `auditory_memory(query?, limit?)` | Searches the bounded, in-process event index created by prior `perceive` calls; returned handles can be listened to again | <1 s |
 | `capabilities()` | Reports installed optional features, platform support, allowed folders and persistence settings | <1 s |
-| `capture(action, ...)` | Records what Windows is playing (Windows only), e.g. a game while you play it. `start`, then press **Ctrl+Alt+M** in-game as each level starts (or ask your assistant to `mark`); `status` = live readout; `snapshot` = save the last 30 s for analysis; `stop` = per-level loudness report + timeline | live; report in a few s |
+| `capture(action, ...)` | Records what Windows is playing (Windows only). `start`, then press **Ctrl+Alt+M** as each new level starts; `status` = live readout; `snapshot` = optionally save recent audio; `stop` = per-level loudness report + timeline. `perceive(source="recent")` reads the buffer without saving | live; report in a few s |
 | `levels(path, splits?, labels?, target_lufs?)` | Loudness per level: a capture split by its markers (or by silences, or your times), or a **folder** of music files (one per level). Gives each level's music level, the dB change and linear volume (e.g. for a Unity AudioSource) to match the others or a target | ~1 s per minute of audio |
 | `find_audio(query, folder?)` | Finds bounces by name, newest first | <1 s |
 
@@ -49,6 +52,10 @@ Bar numbers match FL Studio's playlist **if the bounce starts at bar 1**. Pass `
 - "Run expect on my_track at 130 bpm: where does it break expectations?"
 - "Listen to my_track live, 8 bars at a time, and tell me what you expect before each step"
 - "Send bars 33-40 as a short audio clip so you can listen directly" (audio-capable clients only)
+- "Start monitoring my computer audio. What do you hear in the last 30 seconds?"
+- "Did you hear that strange sound just now? Roughly when did it happen?"
+- "Listen to these two mixes. Which sounds clearer, and does the waveform evidence support that?"
+- "Listen to that exact clip again: did the vocal sound natural or processed?" (uses the returned auditory-memory handle)
 - "What does my_new_idea sound like among my other bounces?"
 - "Find my latest bounce and check it for clipping"
 - "Listen to my game while I play. I'll press Ctrl+Alt+M at each new level" ... "how's this level compared to the others?" ... "stop: which levels need turning up or down?"
@@ -57,12 +64,31 @@ Bar numbers match FL Studio's playlist **if the bounce starts at bar 1**. Pass `
 
 Note names follow FL Studio's piano roll (middle C = C5). The saved MIDI is at your BPM in 4/4 and snapped to 1/16, so dragging it into FL at bar 1 lines it up with the bounce.
 
-`listen_live` returns a `session_id`. Clients must pass that handle into each later call so independent conversations cannot affect one another.
+`listen_live` returns a `session_id`. Clients must pass that handle into each later call so independent conversations cannot affect one another. `perceive` similarly returns a `memory_id`; passing it back asks another question about the exact immutable audio rather than a newly captured window.
+
+## Perception setup
+
+The first built-in backend is [Gemini's on-demand audio-understanding API](https://ai.google.dev/gemini-api/docs/generate-content/audio). Set an API key in the MCP server environment:
+
+```json
+{
+  "EARS_ALLOWED_ROOTS": "C:\\Users\\me\\Music",
+  "GEMINI_API_KEY": "your-key",
+  "EARS_PERCEPTION_PROVIDER": "gemini",
+  "EARS_GEMINI_MODEL": "gemini-3.8-flash"
+}
+```
+
+Then use `capture(action="start")`, play the sound, and call `perceive(source="recent", seconds=30, question="What happened?")`. Ears copies the selected raw buffer in memory and sends only that immutable window. It does not create a snapshot file. Files can also be perceived directly, and `against` adds a second labelled clip for A/B listening.
+
+The provider boundary is deliberately small. Local or alternative cloud integrations can implement the `PerceptionBackend` protocol and call `register_backend(name, factory)` in `ears.perception`; the MCP tool and result schema do not depend on Gemini. A Qwen or other local adapter can therefore be added without changing clients.
+
+Perception is on demand, not uninterrupted cloud streaming. Prior calls form a bounded event index searchable with `auditory_memory`, but an ordinary MCP server cannot proactively insert commentary into an arbitrary chat; the client still decides when tools run.
 
 ### Game captures, what to know
 
 - It records **everything** the output device plays, so close YouTube/Spotify/Discord first (ears lists any other apps it heard).
-- It undoes the Windows volume slider, so numbers are what the game sends, not how loud your speakers are. In-game volume settings and the per-app mixer *do* count, so keep them where players will have them.
+- The saved recording and perception buffer preserve raw Windows loopback audio. A separate temporary signal undoes the Windows volume slider for loudness measurements, so correction cannot distort what the audio model hears. In-game volume settings and the per-app mixer *do* count.
 - The "music level" ignores short loud sound effects. Constant effects (non-stop gunfire) still mix in; for the cleanest reading turn the game's SFX off while capturing.
 - Browser games: keep the game's tab visible. A hidden or minimised tab can slow the game right down, and the music may never start.
 - Recordings go to `ears captures\` in your music folder as FLAC (roughly 10-20 MB a minute), with a `.markers.json` beside each. Recording stops on its own after 90 minutes.
@@ -117,7 +143,8 @@ Ears speaks standard MCP over stdio. Configure your client to run `ears-mcp` and
     "ears": {
       "command": "C:\\path\\to\\ears\\.venv\\Scripts\\ears-mcp.exe",
       "env": {
-        "EARS_ALLOWED_ROOTS": "C:\\Users\\me\\Music"
+        "EARS_ALLOWED_ROOTS": "C:\\Users\\me\\Music",
+        "GEMINI_API_KEY": "your-key"
       }
     }
   }
@@ -136,13 +163,20 @@ Clients that do not forward images or audio to their model still receive the com
 - `EARS_CACHE_DIR`: opt-in persistent cache for learned CLAP fingerprints. Without it, the cache is memory-only.
 - `EARS_CAPTURE_DIR`: Windows capture folder. Default: `<first allowed folder>/ears captures`; it must remain inside an allowed root.
 - `EARS_MARK_HOTKEY`: Windows in-game marker hotkey. Default: `ctrl+alt+m`.
+- `EARS_PERCEPTION_PROVIDER`: perception backend used by `provider="auto"`. Default: `gemini`.
+- `GEMINI_API_KEY` or `GOOGLE_API_KEY`: enables the built-in Gemini perception backend.
+- `EARS_GEMINI_MODEL`: Gemini model ID. Default: `gemini-3.8-flash`.
+- `EARS_PERCEPTION_TIMEOUT`: provider request timeout in seconds. Default: `90`.
 
 ## Privacy and side effects
 
 - Core analysis is local and does not upload source audio.
+- `perceive` sends only the selected immutable audio window to its configured provider. Gemini calls use its API directly and return text/JSON to any MCP client. Effectively silent windows are handled locally and are not uploaded.
+- Perception memory is bounded, process-local and never written to disk. It disappears when Ears restarts.
 - `describe`, `expect`, `listen_live` and `sounds_like` may download pinned CLAP weights from Hugging Face on first use.
 - `audio_clip` returns source audio to the MCP client. The client may transmit it to its configured model provider, so the tool should only be called at the user's explicit request.
 - `stems` writes WAV files next to the source; `notes` writes MIDI; `capture` writes recordings and marker files.
+- Recent perception reads the capture buffer directly. `capture(action="snapshot")` is the explicit way to save a recent excerpt.
 - Generated images are returned inline and are only saved when `EARS_SAVE_OUTPUTS=1`.
 
 ## Self-test
@@ -150,9 +184,12 @@ Clients that do not forward images or audio to their model still receive the com
 ```powershell
 .venv\Scripts\python.exe tests\selftest.py
 .venv\Scripts\python.exe tests\contract_test.py
+.venv\Scripts\python.exe tests\perception_test.py
 ```
 
-The synthetic-audio suite checks tempo, key, sections, clipping, MP3/FLAC decoding, comparison, path safety and game-level loudness. Optional model-backed checks run when their packages are installed. The contract test starts the real stdio server, verifies every tool has an output schema, checks structured results and exercises standard MCP audio content.
+The synthetic-audio suite checks tempo, key, sections, clipping, MP3/FLAC decoding, comparison, path safety and game-level loudness. Perception tests cover silence, A/B input, provider failure, exact-audio follow-ups, event memory and separation of raw listening audio from corrected measurements. Optional model-backed checks run when their packages are installed. The contract test starts the real stdio server and verifies structured results and media contracts.
+
+The device/provider acceptance checklist in [tests/perception_acceptance.md](tests/perception_acceptance.md) covers real music, mixed dialogue/effects, A/B judgement, text-only clients and failure/disconnection behaviour.
 
 GitHub Actions runs the core suite on Windows and Linux with Python 3.12 and 3.13.
 

@@ -30,6 +30,7 @@ from .paths import (
     resolve_audio_path,
     save_outputs_enabled,
 )
+from .perception import PerceptionError
 
 INSTRUCTIONS = (
     "ears measures audio files under folders the user has allowed. "
@@ -38,6 +39,10 @@ INSTRUCTIONS = (
     "`expect` for a bar-by-bar surprise map (listening as prediction), `listen_live` to step through a track without "
     "seeing ahead (write your own prediction before each call), `sounds_like` to compare against the user's other tracks, "
     "`find_audio` to locate files by name, and `capabilities` to check optional features. "
+    "Use `perceive` when the user asks what arbitrary audio actually sounds like: it sends an immutable recent "
+    "capture window or file excerpt to a configured audio-native provider and returns grounded text, measurements, "
+    "uncertainty and a memory handle for follow-up questions. Because perception may upload source audio, call it "
+    "only when the user asks Ears to hear, identify, critique or compare sound. `auditory_memory` searches prior results. "
     "`capture` records what the computer is playing (e.g. a game while the user plays: start, mark each new level, "
     "status for live levels, snapshot to grab the last seconds, stop for a per-level loudness report); `levels` "
     "compares loudness per level for a recording or per file for a folder of level music. "
@@ -80,7 +85,7 @@ def friendly(fn):
             return fn(*args, **kwargs)
         except ToolError:
             raise
-        except (PermissionError, FileNotFoundError, ValueError) as exc:
+        except (PermissionError, FileNotFoundError, ValueError, PerceptionError) as exc:
             raise ToolError(str(exc)) from exc
         except Exception as exc:
             traceback.print_exc(file=sys.stderr)
@@ -628,9 +633,18 @@ def _module_available(*names: str) -> bool:
 @friendly
 def capabilities() -> ReportResult:
     """Show installed features, platform constraints, allowed folders and persistence settings."""
+    from .perception import provider_status
+
+    perception = provider_status()
+    perception["available"] = any(p.get("configured") for p in perception["providers"].values())
+    perception["recent_source_available"] = (
+        sys.platform == "win32" and _module_available("soundcard", "pycaw", "comtypes")
+    )
+    perception["network"] = "Provider-dependent; Gemini uploads only the selected immutable audio window."
     features = {
         "listen_compare_levels": {"available": True, "network": False},
         "audio_clip": {"available": True, "network": False, "max_seconds": {"mono": 15, "stereo": 6}},
+        "perception": perception,
         "stems": {
             "available": _module_available("torch", "demucs"),
             "network": "May download pretrained Demucs weights on first use if not cached.",
@@ -720,6 +734,110 @@ def audio_clip(
     return _result(report, audio=(payload, "wav"))
 
 
+def _perception_window(source: str, seconds: float, label: str):
+    from .perception import AudioWindow, window_from_file
+
+    if source.strip().lower() == "recent":
+        if sys.platform != "win32":
+            raise ValueError("The recent system-audio source is currently available on Windows 10/11 only. "
+                             "Pass an audio file path on this platform.")
+        from . import capture as cap
+
+        rec = cap.current()
+        if rec is None:
+            raise ValueError("No recent system audio exists. Start capture first, then play the sound and call perceive.")
+        samples, sample_rate, meta = rec.recent_audio(seconds)
+        warnings = []
+        if meta.get("error"):
+            warnings.append(f"Capture device error after this audio was recorded: {meta['error']}")
+        if not meta.get("running"):
+            warnings.append("Capture is no longer running; this is the final retained window.")
+        if meta.get("muted_during_session"):
+            warnings.append("Windows output was muted during part of this capture session.")
+        return AudioWindow(
+            label=label,
+            samples=samples,
+            sample_rate=sample_rate,
+            source="recent",
+            origin_start_sec=float(meta["session_start_sec"]),
+            origin_end_sec=float(meta["session_end_sec"]),
+            warnings=tuple(warnings),
+        )
+    real = resolve_audio_path(source)
+    return window_from_file(real, seconds, label)
+
+
+@mcp.tool(annotations=ToolAnnotations(title="Perceive arbitrary audio", readOnlyHint=False,
+                                      destructiveHint=False, idempotentHint=False, openWorldHint=True))
+@friendly
+def perceive(
+    source: Annotated[str, Field(
+        description="'recent' for the current capture buffer, or an absolute path to an allowed audio file.")] = "recent",
+    seconds: Annotated[float, Field(
+        description="How much audio to hear, taken from the end of the source (max 60 seconds).", ge=3, le=60)] = 30,
+    question: Annotated[str, Field(
+        description="Open-ended question about what is audible, e.g. 'What happened?' or 'Does this mix work?'.",
+        min_length=1, max_length=2000)] = "What do you hear?",
+    provider: Annotated[str, Field(
+        description="Audio-native backend. 'auto' uses EARS_PERCEPTION_PROVIDER (default: Gemini).",
+        min_length=1, max_length=64)] = "auto",
+    against: Annotated[str | None, Field(
+        description="Optional second allowed audio file (or 'recent') for an A/B listening comparison.")] = None,
+    memory_id: Annotated[str | None, Field(
+        description="Returned by an earlier perceive call. Reuses that exact immutable audio for a follow-up question.")] = None,
+) -> ReportResult:
+    """Ask an audio-native model an open-ended question about recent system audio or a file.
+
+    The result is text and structured data, so this works even when the MCP client cannot forward audio. The selected
+    audio window is sent directly to the configured provider; with Gemini, that means it leaves the computer. Ears
+    returns model observations, deterministic measurements, recommendations and uncertainty as separate layers.
+    Use memory_id for follow-ups so Ears listens to exactly the same waveform instead of silently recapturing it.
+    """
+    from .perception import perceive_windows, recall
+
+    if memory_id:
+        # Resolve before any capture/file work so a follow-up cannot accidentally listen to new audio.
+        item = recall(memory_id)
+        windows = item.windows
+    else:
+        windows = (_perception_window(source, seconds, "A" if against else "audio"),)
+        if against:
+            if seconds > 30:
+                raise ValueError("A/B perception is limited to 30 seconds per source to bound upload size and cost.")
+            windows += (_perception_window(against, seconds, "B"),)
+    report = perceive_windows(windows, question, provider, memory_id)
+    report["privacy"] = (
+        "The selected audio is sent to the configured perception provider unless the local silence guard handles it. "
+        "No recording file is created for a recent-audio question."
+    )
+    return _result(report)
+
+
+@mcp.tool(annotations=ToolAnnotations(title="Search auditory memory", readOnlyHint=True,
+                                      destructiveHint=False, idempotentHint=True, openWorldHint=False))
+@friendly
+def auditory_memory(
+    query: Annotated[str, Field(
+        description="Optional word or phrase to find in prior perception observations.", max_length=500)] = "",
+    limit: Annotated[int, Field(description="Maximum recent perception windows to return.", ge=1, le=20)] = 10,
+) -> ReportResult:
+    """Search bounded in-process perception history by its observed summaries and events.
+
+    This is an event index over audio that has already been perceived, not continuous background interpretation.
+    Use a returned memory_id with perceive to listen again and ask a follow-up about the original immutable audio.
+    """
+    from .perception import memory_index
+
+    rows = memory_index(query, limit)
+    return _result({
+        "query": query,
+        "memories": rows,
+        "bounded": True,
+        "persistence": "Memory is process-local, size-bounded and disappears when Ears restarts.",
+        "proactive_limit": "MCP clients decide when tools run; Ears cannot inject observations into an arbitrary chat.",
+    })
+
+
 @mcp.tool(annotations=ToolAnnotations(title="Listen to the computer (record a game while you play)",
                                       readOnlyHint=False, destructiveHint=False, idempotentHint=False,
                                       openWorldHint=False))
@@ -741,8 +859,9 @@ def capture(
     Typical use: start -> the user plays, pressing the hotkey (Ctrl+Alt+M) when each new level starts, or telling
     you so you can `mark` it -> `status` any time for live levels ("level 3 is running +4 dB vs the earlier levels")
     -> `snapshot` to grab the last seconds and run listen/describe on them -> stop for a per-level loudness report
-    with suggested volume changes. Captures everything the output device plays, corrected for the Windows volume
-    slider; other apps making sound are reported. Recordings go to <music folder>\\ears captures.
+    with suggested volume changes. Captures everything the output device plays. Raw loopback audio is retained for
+    recording/perception; a separate temporary volume-corrected signal is used for measurements. Other apps making
+    sound are reported. Recordings go to <music folder>\\ears captures.
     """
     if sys.platform != "win32":
         raise ValueError("System-audio capture is currently available on Windows 10/11 only.")
@@ -755,9 +874,11 @@ def capture(
         time.sleep(1.2)  # let the hotkey and volume watcher report in
         st = rec.status()
         st["tell_the_user"] = (f"Recording. Play normally; press {rec.hotkey.upper()} as each new level starts "
-                               "(or tell me). Close other apps that make sound. Ask for status any time; say stop "
-                               "when done." if rec.hotkey_ok else
-                               "Recording. The marker hotkey isn't available, so tell me when each level starts.")
+                               "(or tell me). Close other apps that make sound. Ask what I heard at any time; "
+                               "perceive reads the recent buffer without saving it. Say stop when done."
+                               if rec.hotkey_ok else
+                               "Recording. The marker hotkey isn't available, so tell me when each level starts. "
+                               "You can still ask what I heard at any time.")
         return _result(st)
     rec = cap.current()
     if rec is None:
@@ -780,8 +901,12 @@ def capture(
         cap.stop()
     path = rec.final_path()
     if rec.error and not os.path.isfile(path):
+        rec.cleanup_measurement()
         raise ValueError(f"The recording failed: {rec.error}")
-    out = _level_output(path)
+    try:
+        out = _level_output(rec.measurement_path())
+    finally:
+        rec.cleanup_measurement()
     head = dict(out.structured_content)
     head = {"recording": path, "length": cap.mmss(rec.elapsed()), "markers": len(rec.markers), **head}
     if rec.error:
