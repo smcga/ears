@@ -80,6 +80,15 @@ class JournalTests(unittest.TestCase):
             self.assertEqual([r[0] for r in store.db.execute("SELECT id FROM events ORDER BY start")], keys[1:])
             self.assertEqual(len(list(store.clips.glob("*.flac"))), 2)
 
+    def test_reader_honours_daemon_retention_policy(self):
+        config = dataclasses.replace(self.config, hours=48)
+        with Journal(config) as store:
+            key = self.add(store, self.now - 90000)
+            store.state(retention_hours=48)
+        with Journal(self.config) as reader:
+            self.assertEqual(reader.get(key)["id"], key)
+            self.assertTrue(reader.search(since="2d ago", query="shouted"))
+
     def test_disk_budget_keeps_newest_and_recovers_orphans(self):
         rng = np.random.default_rng(5)
         noise = rng.uniform(-0.5, 0.5, (8000, 2)).astype(np.float32)

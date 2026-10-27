@@ -856,8 +856,10 @@ def timeline(
     if (config.root / "journal.sqlite3").is_file():
         with Journal(config) as journal:
             events = journal.search(since, until, query, limit)
-    return _result({"events": events, "daemon": daemon_status(config), "query": query,
-                    "retention_hours": config.hours, "clip_budget_bytes": config.max_bytes,
+    state = daemon_status(config)
+    return _result({"events": events, "daemon": state, "query": query,
+                    "retention_hours": state.get("retention_hours", config.hours),
+                    "clip_budget_bytes": state.get("clip_budget_bytes", config.max_bytes),
                     "app_attribution": "Apps active in the output mix; individual sound sources are uncertain."})
 
 

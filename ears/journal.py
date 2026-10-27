@@ -135,6 +135,11 @@ class Journal:
             raise PermissionError("Journal clip escaped its store.")
         return path
 
+    def retention_hours(self):
+        # Readers use the writer's policy even when the MCP client only sets EARS_JOURNAL_DIR.
+        row = self.db.execute("SELECT value FROM daemon_state WHERE key='retention_hours'").fetchone()
+        return float(json.loads(row[0])) if row else self.config.hours
+
     def add(self, start: float, end: float, result: dict, samples=None, sr=48000, apps=()) -> str:
         if not math.isfinite(start) or not math.isfinite(end) or end < start:
             raise ValueError("Invalid event interval.")
@@ -212,7 +217,7 @@ class Journal:
         lower, upper = parse_time(since, now - 3600), parse_time(until, now)
         if lower > upper:
             raise ValueError("since must precede until.")
-        lower = max(lower, now - self.config.hours * 3600)
+        lower = max(lower, now - self.retention_hours() * 3600)
         if lower > upper:
             return []
         # User search is a literal substring, never SQL or a query-language expression.
@@ -224,7 +229,7 @@ class Journal:
 
     def get(self, event_id: str):
         row = self.db.execute("SELECT * FROM events WHERE id=?", (event_id,)).fetchone()
-        if row is None or row["start"] < time.time() - self.config.hours * 3600:
+        if row is None or row["start"] < time.time() - self.retention_hours() * 3600:
             raise ValueError("Journal event is missing or expired under the retention policy.")
         return row
 

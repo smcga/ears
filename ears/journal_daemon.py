@@ -134,6 +134,8 @@ def run(config=None, source_factory=None, models=None, stop=None):
                             samples = np.array(raw, dtype=np.float32, copy=True)
                             if samples.ndim == 1:
                                 samples = samples[:, None]
+                            if samples.ndim != 2 or not len(samples) or not np.isfinite(samples).all():
+                                raise ValueError("Audio device returned an empty or invalid block; reconnecting.")
                             duration = len(samples) / source.sample_rate
                             if cursor is None:
                                 cursor = time.time() - duration
@@ -148,7 +150,8 @@ def run(config=None, source_factory=None, models=None, stop=None):
                             except queue.Full:
                                 dropped += 1
                             status.state(status="listening", heartbeat=time.time(), device=source.name,
-                                         last_capture_end=cursor, dropped_blocks=dropped, app_attribution_error=app_error)
+                                         last_capture_end=cursor, dropped_blocks=dropped, app_attribution_error=app_error,
+                                         error=None)
                         if not stop.is_set():
                             raise RuntimeError("Audio source ended unexpectedly.")
                     except Exception as exc:
@@ -162,7 +165,8 @@ def run(config=None, source_factory=None, models=None, stop=None):
         with Journal(config) as store:
             store.reconcile()
             store.prune()
-            store.state(status="starting", pid=os.getpid(), started=time.time())
+            store.state(status="starting", pid=os.getpid(), started=time.time(),
+                        retention_hours=config.hours, clip_budget_bytes=config.max_bytes)
             processor = Segmenter(store, models or LocalModels(config))
             def capture_runner():
                 try:
