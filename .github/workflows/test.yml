@@ -28,3 +28,4 @@ jobs:
         env:
           EARS_SKIP_MCP_TEST: "1"
       - run: python tests/contract_test.py
+      - run: python tests/perception_test.py

@@ -384,8 +384,9 @@ async def run_mcp_test():
     async with Client(params, mode="legacy", read_timeout_seconds=20) as client:
             listed = (await client.list_tools()).tools
             tools = sorted(t.name for t in listed)
-            check(tools == ["audio_clip", "capabilities", "capture", "compare", "describe", "expect",
-                            "find_audio", "levels", "listen", "listen_live", "notes", "sounds_like", "stems"],
+            check(tools == ["audio_clip", "auditory_memory", "capabilities", "capture", "compare", "describe",
+                            "expect", "find_audio", "levels", "listen", "listen_live", "notes", "perceive",
+                            "sounds_like", "stems"],
                   f"tools listed: {tools}")
             check(all(t.output_schema for t in listed), "every tool advertises structured output")
             t0 = time.time()
